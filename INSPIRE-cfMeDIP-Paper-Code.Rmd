@@ -1,0 +1,3967 @@
+---
+title: "INSPIRE cfMeDIP-seq Analysis"
+author: "Eric Zhao"
+date: "11/13/2020"
+output:
+  rmdformats::readthedown:
+    self_contained: true
+    lightbox: true
+    gallery: false
+    highlight: tango
+    toc_depth: 3
+---
+
+In the interest of transparency, openness, and reproducibility, this report contains the analysis code which generates all of the figures and numerical results for the manuscript entitled *Early changes in tumor-agnostic cell-free methylomes and fragmentomes predict outcomes in patients with solid tumors treated with pembrolizumab*. In it, we report on the results of cell-free methylated DNA immunoprecipitation and sequencing (cfMeDIP-seq) from the investigator-initiated phase 2 study of pembrolizumab immunological response evaluation (INSPIRE).
+
+Using Rstudio or the knitr package in R, all results reported in the manuscript can be regenerated in full using this RMarkdown file. All of the processed, deidentified data are stored in `figure_data.Rds` as dataframes and are attached to the environment in the setup block. Our nomenclature is variable names starting with `df` to denote source data tables and `plotdata` for processed dataframes used as intermediates to generate figures. Below is the high-level description of source dataframe.
+
+- `df_samples`: Mapping of technical sequencing library IDs to patient/timepoint IDs.
+- `df_clinical`: Deidentified clinical data, with emphasis on RECIST best response and survival outcomes.
+- `df_methylation_signature`: All sites in the methylation signature and associated metadata.
+- `df_posterior`: Complete table of methylation posterior probabilities, one for each sample and genomic window within the methylation signature.
+- `df_csm`: Cancer-specific methylation scores, one for each sample of INSPIRE patients.
+- `df_csm_normalcontrol`: Cancer-specific methylation scores, one for each sample of normal controls.
+- `df_natera_response`: Bespoke mutation-based ctDNA levels per patient, with change from baseline to cycle 3. Same values as reported by Bratman & Yang et al. 2020.
+- `df_natera_timepoint`: Bespoke mutation-based ctDNA levels, one per sample.
+- `df_biomarkers`: Immunologic biomarkers used in multivariate analysis, specifically PD-L1 expression and tumor mutation burden.
+- `df_fls`: Fragment length scores, one per sample.
+- `df_fragment_ratio`: Fragment length ratios in 5 Mb segments.
+- `df_fragment_ratio_vartest_regions`: Results of variance tests for fragment length ratios of 5 Mb segments.
+- `df_insertsize`: Global fragment length distributions extracted by Picard.
+- `df_nucleosomes`: Nucleosome position features.
+- `df_example_coverage`: cfMeDIP-seq window coverage within the CSM methylation signature for nine example patients for illustrating how CSM is calculated.
+- `df_clearance_natera`: Bespoke mutation-based ctDNA clearance status, as reported by Bratman & Yang et al. 2020.
+- `df_chromosome_lengths`: hg38 chromosome lengths.
+- `df_read_counts`: Actual read counts for each sequenced library.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, dev='png', dpi=300, fig.path='figures/')
+
+library(forestmodel)
+library(cowplot)
+library(survival)
+library(survminer)
+library(lubridate)
+library(ggthemr)
+library(ggbeeswarm)
+library(arrow)
+library(viridis)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(RColorBrewer)
+library(NMF)
+library(png)
+library(grid)
+library(pander)
+library(kernlab)
+library(ggrepel)
+library(yaml)
+library(data.table)
+
+panderOptions('round', 3)
+panderOptions('table.style', 'rmarkdown')
+
+source('inspire_analysis_scripts.R')
+
+ggthemr('pale')
+
+attach(readRDS('figure_data.Rds'))
+```
+
+
+# Figure 1
+
+```{r overview, fig.width = 8, fig.height = 9}
+# --------------- #
+# CONSORT diagram #
+# --------------- #
+
+img <- readPNG("schematics/Consort-01.png")
+g_consort <- rasterGrob(img, interpolate=TRUE)
+
+# --------------- #
+# Study flowchart #
+# --------------- #
+
+img <- readPNG("schematics/analysis schema-01.png")
+g_flowchart <- rasterGrob(img, interpolate=TRUE)
+
+pd_csm_by_timepoint_group <- df_csm %>%
+  bind_rows(df_csm_normalcontrol) %>%
+  mutate(
+    timepoint_group = case_when(
+      timepoint == 'SB' ~ 'Baseline',
+      timepoint == 'C3B' ~ 'Cycle 3',
+      group == 'Control' ~ 'Control',
+      TRUE ~ 'Later timepoint'
+    ) %>% factor(levels = c('Baseline', 'Cycle 3', 'Later timepoint', 'Control'))
+  )
+
+val_median_csm_cancer_c3 <- pd_csm_by_timepoint_group %>%
+  filter(timepoint_group == 'Cycle 3') %>%
+  .$score %>%
+  median %>%
+  value_to_string()
+
+val_median_csm_cancer_latercycle <- pd_csm_by_timepoint_group %>%
+  filter(timepoint_group == 'Later timepoint') %>%
+  .$score %>%
+  median %>%
+  value_to_string()
+
+val_csm_baseline_vs_control_wilcox_p <- pd_csm_by_timepoint_group %>%
+  filter(timepoint_group %in% c('Baseline', 'Control')) %>%
+  with(wilcox.test(score ~ timepoint_group)$p.value) %>%
+  pval_to_string()
+
+val_csm_c3_vs_control_wilcox_p <- pd_csm_by_timepoint_group %>%
+  filter(timepoint_group %in% c('Cycle 3', 'Control')) %>%
+  with(wilcox.test(score ~ timepoint_group)$p.value) %>%
+  pval_to_string()
+
+val_csm_latercycle_vs_control_wilcox_p <- pd_csm_by_timepoint_group %>%
+  filter(timepoint_group %in% c('Later timepoint', 'Control')) %>%
+  with(wilcox.test(score ~ timepoint_group)$p.value) %>%
+  pval_to_string()
+
+p_csm_by_timepoint_group <- pd_csm_by_timepoint_group %>%
+  ggplot(aes(
+    x = timepoint_group,
+    y = score
+  )) +
+  geom_boxplot(fill = 'white', width = 0.5, outlier.shape = NA) +
+  geom_beeswarm(cex = 0.7) +
+  scale_y_continuous(
+    trans = scales::pseudo_log_trans(base = 10, sigma = 0.1),
+    breaks = c(1, 10, 100),
+    labels = c(1, 10, 100)
+  ) +
+  labs(
+    x = 'Sample type',
+    y = 'Cancer-specific methylation (CSM)'
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_signif(
+    comparisons = list(
+      c('Baseline', 'Control'),
+      c('Cycle 3', 'Control'),
+      c('Later timepoint', 'Control')
+    ),
+    annotations = c(
+      val_csm_baseline_vs_control_wilcox_p,
+      val_csm_c3_vs_control_wilcox_p,
+      val_csm_latercycle_vs_control_wilcox_p
+    ),
+    y_position = c(3.7, 3.4, 3.0),
+    map_signif_level = T
+  )
+
+pd_fls_by_timepoint_group <- df_fls %>%
+  bind_rows(df_fls_control) %>%
+  left_join(df_samples) %>%
+  mutate(
+    timepoint_group = case_when(
+      is.na(cohort) ~ 'Control',
+      timepoint == 'SB' ~ 'Baseline',
+      timepoint == 'C3B' ~ 'Cycle 3',
+      TRUE ~ 'Later timepoint'
+    ) %>% factor(levels = c('Baseline', 'Cycle 3', 'Later timepoint', 'Control'))
+  )
+
+val_median_fls_cancer_c3 <- pd_fls_by_timepoint_group %>%
+  filter(timepoint_group == 'Cycle 3') %>%
+  .$fragment_score %>%
+  median() %>%
+  value_to_string()
+
+val_median_fls_cancer_latercycle <- pd_fls_by_timepoint_group %>%
+  filter(timepoint_group == 'Later timepoint') %>%
+  .$fragment_score %>%
+  median() %>%
+  value_to_string()
+
+val_fls_baseline_vs_control_wilcox_p <- pd_fls_by_timepoint_group %>%
+  filter(timepoint_group %in% c('Baseline', 'Control')) %>%
+  with(wilcox.test(fragment_score ~ timepoint_group)$p.value) %>%
+  pval_to_string()
+
+val_fls_c3_vs_control_wilcox_p <- pd_fls_by_timepoint_group %>%
+  filter(timepoint_group %in% c('Cycle 3', 'Control')) %>%
+  with(wilcox.test(fragment_score ~ timepoint_group)$p.value) %>%
+  pval_to_string()
+
+val_fls_latercycle_vs_control_wilcox_p <- pd_fls_by_timepoint_group %>%
+  filter(timepoint_group %in% c('Later timepoint', 'Control')) %>%
+  with(wilcox.test(fragment_score ~ timepoint_group)$p.value) %>%
+  pval_to_string()
+
+p_fls_by_timepoint_group <- pd_fls_by_timepoint_group %>%
+  ggplot(aes(
+    x = timepoint_group,
+    y = fragment_score
+  )) +
+  geom_boxplot(fill = 'white', width = 0.5, outlier.shape = NA) +
+  geom_beeswarm() +
+  labs(
+    x = 'Sample type',
+    y = 'Fragment length score (FLS)'
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_signif(
+    comparisons = list(
+      c('Baseline', 'Control'),
+      c('Cycle 3', 'Control'),
+      c('Later timepoint', 'Control')
+    ),
+    annotations = c(
+      val_fls_baseline_vs_control_wilcox_p,
+      val_fls_c3_vs_control_wilcox_p,
+      val_fls_latercycle_vs_control_wilcox_p
+    ),
+    y_position = c(2.6, 2.3, 1.9),
+    map_signif_level = T
+  ) 
+
+plot_grid(
+  plot_grid(
+    plot_grid(NULL, g_consort, nrow=1, rel_widths = c(1,20)),
+    g_flowchart,
+    rel_heights = c(4,4),
+    ncol=1,
+    labels = c('A', 'B')
+  ),
+  plot_grid(
+    p_csm_by_timepoint_group,
+    p_fls_by_timepoint_group,
+    ncol = 1,
+    labels = c('C', 'D')
+  ),
+  nrow = 1,
+  rel_widths = c(2.2,1)
+)
+```
+
+
+# Figure 2
+
+```{r cfmedip, fig.width = 10, fig.height = 12}
+# ------------------------- #
+# ctDNA Estimation GLM plot #
+# ------------------------- #
+
+pd_csm_fls_by_group <- df_csm %>%
+  inner_join(df_fls) %>%
+  bind_rows(
+    df_csm_normalcontrol %>%
+      inner_join(df_fls_control %>% dplyr::rename(sample = library))
+  ) %>%
+  left_join(
+    df_clinical %>%
+      distinct(patient, best_response)
+  ) %>%
+  mutate(
+    group = case_when(
+      timepoint == 'SB' ~ 'Baseline',
+      timepoint == 'C3B' ~ 'Cycle 3',
+      group == 'Control' ~ 'Normal Control',
+      TRUE ~ 'Later timepoint'
+    ) %>% factor(levels = c('Baseline', 'Cycle 3', 'Later timepoint', 'Normal Control'))
+  ) %>%
+  mutate(
+    timepoint = factor(timepoint, levels = levels(df_samples$timepoint))
+  ) %>%
+  arrange(patient, timepoint) %>%
+  mutate(log_score = log10(score + 0.01)) %>%
+  filter(!is.na(fragment_score))
+
+pd_baseline_vs_normal <- pd_csm_fls_by_group %>%
+  filter(group %in% c('Baseline', 'Normal Control'))
+
+glm_csm_fls_logistic <- glm(
+  cancer ~ `log CSM` + FLS,
+  family = 'binomial',
+  data = pd_csm_fls_by_group %>%
+    filter(group %in% c('Normal Control', 'Baseline')) %>%
+    mutate(cancer = group != 'Normal Control') %>%
+    dplyr::rename(
+      `log CSM` = log_score,
+      FLS = fragment_score
+    )
+)
+
+pd_csm_fls_by_group_glmprediction <- pd_csm_fls_by_group %>%
+  filter(group != 'Normal Control') %>%
+  dplyr::rename(FLS = fragment_score, `log CSM` = log_score) %>%
+  mutate(
+    prediction = predict(glm_csm_fls_logistic, newdata=.)
+  )
+
+pd_clearance_roc <- pd_csm_fls_by_group_glmprediction %>%
+  filter(!is.na(natera), !is.na(prediction)) %>%
+  arrange(prediction) %>%
+  mutate(
+    TP = cumsum(natera == 0),
+    FP = cumsum(natera > 0)
+  ) %>%
+  arrange(-prediction) %>%
+  mutate(
+    TN = cumsum(natera > 0),
+    FN = cumsum(natera == 0)
+  ) %>%
+  arrange(prediction) %>%
+  mutate(
+    TPR = TP / (TP + FN),
+    FPR = FP / (FP + TN),
+    F1 = TP / (TP + 0.5 * (FP + FN))
+  )
+
+v_clearance_optimal_threshold_F1 <- pd_clearance_roc %>%
+  filter(F1 == max(F1)) %>%
+  filter(row_number() == n()) %>%
+  .$F1 %>%
+  as.numeric()
+
+v_clearance_optimal_threshold <- pd_clearance_roc %>%
+  filter(F1 == max(F1)) %>%
+  filter(row_number() == n()) %>%
+  .$prediction %>%
+  as.numeric()
+
+
+p_glm_prediction_boundary <- crossing(
+  FLS = seq(
+    min(pd_csm_fls_by_group$fragment_score),
+    max(pd_csm_fls_by_group$fragment_score),
+    length=100
+  ),
+  `log CSM` = seq(
+    min(pd_csm_fls_by_group$log_score),
+    max(pd_csm_fls_by_group$log_score),
+    length=100
+  )
+) %>%
+  mutate(
+    prediction = predict(glm_csm_fls_logistic, .)
+  ) %>%
+  ggplot(aes(
+    x = `log CSM`,
+    y = FLS
+  )) +
+  geom_raster(aes(
+    fill = prediction
+  )) +
+  scale_fill_distiller(palette = 'RdBu', direction=-1) +
+  geom_point(
+    aes(
+      x = `log CSM`,
+      y = FLS,
+      shape = group
+    ),
+    data = pd_baseline_vs_normal %>% 
+      dplyr::rename(FLS = fragment_score, `log CSM` = log_score),
+    color = 'black'
+  ) +
+  scale_shape_manual(values = c(17, 1)) +
+  labs(
+    x = 'log Cancer Specific Methylation (CSM)',
+    y = 'Fragment Length Score (FLS)',
+    fill = 'cfMeDIP-seq score'
+  ) +
+  geom_abline(
+    slope = -glm_csm_fls_logistic$coefficients[2] / glm_csm_fls_logistic$coefficients[3],
+    intercept = (v_clearance_optimal_threshold - glm_csm_fls_logistic$coefficients[1]),
+    color = 'black'
+  ) +
+  annotate(
+    geom = 'text',
+    x = -1,
+    y = -1.4,
+    hjust = 0,
+    label = 'Clearance threshold'
+  )
+
+# ---------------------------------------------- #
+# Delta CSM and FLS Response Prediction GLM plot #
+# ---------------------------------------------- #
+
+pd_delta_csm <- df_csm %>%
+  group_by(patient) %>%
+  filter('SB' %in% timepoint) %>%
+  mutate(
+    delta_csm = log10(0.01 + score) - log10(0.01 + score[timepoint == 'SB'])
+  ) %>%
+  ungroup() %>%
+  filter(timepoint != 'SB')
+
+pd_delta_fls <- df_fls %>%
+  left_join(df_samples) %>%
+  group_by(patient) %>%
+  filter('SB' %in% timepoint) %>%
+  mutate(
+    delta_fls = fragment_score - fragment_score[timepoint == 'SB']
+  ) %>%
+  ungroup() %>%
+  filter(timepoint != 'SB')
+
+pd_delta_csm_fls <- pd_delta_csm %>%
+  inner_join(pd_delta_fls) %>%
+  left_join(df_clinical %>% distinct(patient, best_response)) %>%
+  mutate(responder = if_else(best_response %in% c('PR', 'CR'), -1, 1))
+
+p_delta_best_response <- pd_delta_csm_fls %>%
+  ggplot(aes(
+    x = delta_csm,
+    y = delta_fls,
+    color = best_response
+  )) +
+  geom_point() +
+  geom_vline(xintercept = 0, color = 'Grey80') +
+  geom_hline(yintercept = 0, color = 'Grey80') +
+  scale_color_brewer(palette = 'RdBu')
+
+
+# ----------- #
+# Spider Plot #
+# ----------- #
+
+pd_glmprediction_by_timepoint <- pd_csm_fls_by_group_glmprediction %>%
+  left_join(df_clinical %>% distinct(cohort, cohort_label)) %>%
+  left_join(
+    df_clinical %>%
+      select(patient, best_response, best_response_cycle)
+  ) %>%
+  mutate(
+    timepoint_numeric = case_when(
+      timepoint == 'SB' ~ -100,
+      timepoint == 'EOTB' ~ -1,
+      TRUE ~ gsub('C', '', timepoint) %>% gsub('B', '', .) %>% as.numeric
+    ),
+    best_response_cycle_numeric = case_when(
+      best_response %in% c('PD', 'NE') ~ -100,
+      TRUE ~ as.numeric(gsub('(\\d+).*', '\\1', best_response_cycle))
+    ),
+    diff = abs(timepoint_numeric - best_response_cycle_numeric)
+  ) %>%
+  group_by(patient) %>%
+  mutate(
+    best_response_closest = case_when(
+      best_response %in% c('PD', 'NE') ~ 'None',
+      (best_response_cycle_numeric > max(timepoint_numeric)) & ('EOTB' %in% timepoint) ~ 'EOTB',
+      TRUE ~ as.character(timepoint[diff == min(diff)])
+    ),
+    best_response_closest = case_when(
+      best_response_closest == 'SB' ~ 'None',
+      TRUE ~ best_response_closest
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    is_best_response_cycle = timepoint == best_response_closest,
+    responder = if_else(best_response %in% c('PR', 'CR'), 'Responder (PR/CR)', 'Non-responder (SD/PD)'),
+    timepoint_numeric = if_else(timepoint == 'SB', 0, as.numeric(timepoint) + 5),
+    prediction_normalized = (prediction - min(prediction))/(max(prediction) - min(prediction))
+  ) %>%
+  group_by(patient) %>%
+  mutate(
+    change_from_baseline = prediction_normalized - prediction_normalized[timepoint == 'SB'][1],
+    relative_change_from_baseline = (prediction_normalized - prediction_normalized[timepoint == 'SB'][1]) / prediction_normalized[timepoint == 'SB'][1]
+  ) %>%
+  ungroup()
+
+p_glmprediction_by_timepoint <- pd_glmprediction_by_timepoint %>%
+  filter(!is.na(cohort)) %>%
+  ggplot(aes(
+    x = timepoint_numeric,
+    y = change_from_baseline,
+    color = cohort_label,
+    group = patient
+  )) +
+  facet_grid(. ~ responder) +
+  geom_line(size = 0.3) +
+  geom_point(
+    aes(
+      shape = is_best_response_cycle,
+      size = is_best_response_cycle
+    )
+  ) +
+  scale_shape_manual(values = c(16, 2)) +
+  scale_size_manual(values = c(1,3)) +
+  scale_color_brewer(palette = 'Set1') +
+  labs(
+    x = 'Timepoint',
+    y = 'Joint ctDNA score\nNormalized change from baseline',
+    color = 'Cohort',
+    shape = 'Best response cycle',
+    size = 'Best response cycle'
+  ) +
+  scale_x_continuous(
+    breaks = pd_glmprediction_by_timepoint$timepoint_numeric %>% unique %>% sort,
+    labels = if_else(levels(pd_glmprediction_by_timepoint$timepoint) %in% c('SB', 'C3B', 'EOTB'), levels(pd_glmprediction_by_timepoint$timepoint), '')
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = 'right',
+    legend.box = 'vertical'
+  )
+
+# ------------ #
+# Correlations #
+# ------------ #
+
+pd_cfmedip_vs_natera_correlations <- pd_glmprediction_by_timepoint %>%
+  filter(group %in% c('Baseline', 'Cycle 3')) %>%
+  group_by(
+    group,
+    cohort
+  ) %>%
+  filter(!is.na(prediction), !is.na(natera)) %>%
+  summarise(
+    spearman = cor(prediction, natera, method='spearman'),
+    p = cor.test(prediction, natera, method='spearman')$p.value,
+    p_string = if_else(p < 0.001, 'p<0.001', sprintf('p=%s', as.character(signif(p, 3))))
+  ) %>%
+  ungroup()
+
+p_cfmedip_vs_natera_correlation <- pd_glmprediction_by_timepoint %>%
+  mutate(
+    below_clearance_threshold = if_else(
+      prediction < v_clearance_optimal_threshold,
+      'Below clearance threshold',
+      'No clearance'
+    )
+  ) %>%
+  filter(group %in% c('Baseline', 'Cycle 3')) %>%
+  ggplot(aes(
+    x = prediction,
+    y = natera
+  )) +
+  geom_smooth(method = 'lm', fill = 'Grey80', color = 'Grey60') +
+  geom_point(aes(
+    color = below_clearance_threshold
+  ), size = 2) +
+  facet_grid(group ~ cohort) +
+  scale_y_continuous(
+    trans=scales::pseudo_log_trans(base = 10, sigma = 0.0001),
+    breaks = c(0.0001, 0.01, 1, 100),
+    labels = c(0, 0.01, 1, 100)
+  ) +
+  geom_text(
+    x = -1.8,
+    y = 5.5,
+    hjust = 0,
+    vjust = 0,
+    size = 3.5,
+    aes(
+      label = sprintf('rho=%s\n%s', signif(spearman, 3), p_string)
+    ),
+    data = pd_cfmedip_vs_natera_correlations
+  ) +
+  labs(
+    x = 'Joint ctDNA score from cfMeDIP-seq',
+    y = 'Cancer mutation concentration\nfrom bespoke targeted sequencing',
+    color = 'cfMeDIP-seq clearance'
+  ) +
+  scale_color_brewer(palette = 'Set1') +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = 'bottom',
+    strip.text = element_text(size=12, face='bold')
+  )
+
+# ----------------- #
+# Threshold Setting #
+# ----------------- #
+
+p_clearance_f1 <- pd_clearance_roc %>%
+  ggplot(aes(
+    x = prediction,
+    y = F1
+  )) +
+  geom_line(color = 'black') +
+  geom_vline(xintercept = v_clearance_optimal_threshold) +
+  annotate(
+    geom = 'point',
+    x = v_clearance_optimal_threshold,
+    y = v_clearance_optimal_threshold_F1,
+    color = 'black',
+    size = 3
+  ) +
+  annotate(
+    geom = 'text',
+    x = v_clearance_optimal_threshold + 0.2,
+    y = 0,
+    size = 4,
+    label = sprintf('Clearance\nthreshold = %s', round(v_clearance_optimal_threshold, 3)),
+    hjust = 0,
+    vjust = 0
+  ) +
+  labs(
+    x = 'Joint ctDNA score',
+    y = 'F1 accuracy'
+  ) +
+  theme(
+    panel.grid = element_blank()
+  )
+
+val_clearance_auroc <- pd_clearance_roc %>%
+  summarise(
+    current_FPR = FPR,
+    previous_FPR = c(0, FPR[1:(n()-1)]),
+    width = current_FPR - previous_FPR,
+    height = TPR
+  ) %>%
+  mutate(area = width * height) %>%
+  with(sum(area)) %>%
+  value_to_string()
+
+p_clearance_roc <- pd_clearance_roc %>%
+  ggplot(aes(
+    x = FPR,
+    y = TPR
+  )) +
+  geom_path() +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  geom_point(
+    data = pd_clearance_roc %>%
+      filter(prediction == v_clearance_optimal_threshold),
+    size = 4,
+    color = 'black'
+  ) +
+  geom_text_repel(
+    aes(
+      label = round(v_clearance_optimal_threshold, 3)
+    ),
+    data = pd_clearance_roc %>%
+      filter(prediction == v_clearance_optimal_threshold),
+    nudge_x = 0.2,
+    nudge_y = -0.1
+  ) +
+  annotate(
+    geom = 'text',
+    x = 0.5,
+    y = 0.2,
+    label = sprintf('AUROC = %s', val_clearance_auroc),
+    size = 5
+  ) +
+  labs(
+    x = 'False positive rate',
+    y = 'True positive rate'
+  ) +
+  theme(
+    panel.grid = element_blank()
+  )
+
+# ------- #
+# Legends #
+# ------- #
+
+p_legends_glm <- plot_grid(
+  get_legend(
+    p_glm_prediction_boundary +
+      theme(legend.position = 'bottom', legend.box='vertical')
+  )
+)
+
+p_glm_forest_model <- glm_csm_fls_logistic %>%
+  forest_model(
+    recalculate_width = 5,
+    format_options = forest_model_format_options(
+      colour = "black",
+      color = NULL,
+      shape = 15,
+      text_size = 4,
+      point_size = 4,
+      banded = TRUE
+    )
+  )
+
+# -------------------------- #
+# Putting the image together #
+# -------------------------- #
+
+plot_grid(
+  plot_grid(
+    plot_grid(
+      plot_grid(
+        NULL,
+        p_glm_forest_model,
+        plot_grid(
+          ggplot() +
+            ggtitle('         Setting the clearance threshold') +
+            theme_void() +
+            theme(title = element_text(face='bold')),
+          plot_grid(
+            p_clearance_f1,
+            p_clearance_roc,
+            nrow = 1
+          ),
+          ncol=1,
+          rel_heights = c(2, 20),
+          labels = 'C'
+        ),
+        rel_heights = c(0.5,3,5),
+        ncol=1
+      ),
+      plot_grid(
+        p_glm_prediction_boundary +
+          theme(legend.position = 'none') +
+          ggtitle('ctDNA estimation'),
+        p_legends_glm,
+        rel_heights = c(3,1),
+        nrow = 2, 
+        byrow = F
+      ),
+        #theme(
+         # legend.position = c(1, 0),
+        #  legend.justification = c(1, 0)
+        #),
+      nrow = 1,
+      rel_widths = c(5, 3.5),
+      labels = c('A', 'B')
+    ),
+    p_cfmedip_vs_natera_correlation,
+    ncol = 1,
+    rel_heights = c(3,3),
+    labels = c('', 'D')
+  ),
+  p_glmprediction_by_timepoint,
+  ncol = 1,
+  rel_heights = c(8,3),
+  labels = c('', 'E')
+)
+```
+
+
+# Figure 3
+
+```{r treatment_response, fig.width = 18, fig.height = 12}
+plotdata_probewise_diff <- df_posterior %>%
+  gather(library, posterior, -probeID, -immune_group, -bin_chr, -bin_start, -bin_end, -chromStart, -chromEnd, -cpg_count) %>%
+  left_join(df_samples) %>%
+  group_by(probeID, sample, patient, cohort, timepoint, immune_group) %>%
+  summarise(posterior = mean(posterior)) %>%
+  ungroup() %>%
+  mutate(
+    probeID = factor(probeID, levels = unique(probeID))
+  ) %>%
+  filter(timepoint %in% c('SB', 'C3B')) %>%
+  select(-sample) %>%
+  spread(timepoint, posterior) %>%
+  filter(!is.na(SB), !is.na(C3B)) %>%
+  mutate(diff = C3B - SB) %>%
+  left_join(df_clinical %>% select(patient, best_response)) %>%
+  mutate(best_response = factor(best_response, levels = c('PD', 'SD', 'PR', 'CR'))) %>%
+  arrange(cohort, best_response) %>%
+  mutate(patient = factor(patient, levels = unique(patient))) %>%
+  left_join(df_clinical %>% distinct(cohort, cohort_label))
+
+# ---------------------------------------------- #
+# Heatmap of differences from SB to C3B by probe #
+# ---------------------------------------------- #
+
+vector_patient_probewise_diff_order <- pd_delta_csm %>%
+  filter(timepoint == 'C3B') %>%
+  arrange(cohort, delta_csm) %>%
+  .$patient
+
+plotdata_probewise_diff <- plotdata_probewise_diff %>%
+  mutate(
+    patient = factor(patient, levels = vector_patient_probewise_diff_order)
+  )
+  
+plotdata_probewise_diff <- plotdata_probewise_diff %>%
+  mutate(probeID = factor(
+    probeID,
+    levels = plotdata_probewise_diff %>%
+      group_by(probeID) %>%
+      summarise(sum_diff = sum(abs(diff))) %>%
+      arrange(sum_diff) %>%
+      .$probeID
+  ))
+
+plot_heatmap_probewise_diff <- plotdata_probewise_diff %>%
+  ggplot(aes(
+  )) +
+  geom_tile(aes(
+    y = probeID,
+    x = patient,
+    fill = diff
+  )) +
+  geom_segment(
+    aes(
+      x = max_patient_idx + 0.5,
+      xend = max_patient_idx + 0.5,
+      y = 0,
+      yend = plotdata_probewise_diff %>% distinct(probeID) %>% nrow()
+    ),
+    data = plotdata_probewise_diff %>%
+      group_by(cohort) %>%
+      summarise(max_patient_idx = max(as.numeric(patient))) %>%
+      filter(row_number() != n())
+  ) +
+  theme(
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.y = element_text(angle = 0, vjust=0.5),
+    panel.background = element_blank(),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    y = 'Region',
+    fill = 'Change in\nMethylation'
+  ) +
+  scale_fill_distiller(palette = 'RdBu', limits = c(-1, 1))
+
+
+# ---------------------------------------------- #
+# Colorbars showing the cohort and best response #
+# ---------------------------------------------- #
+
+plot_colorbar_probewise_diff_cohort <- plotdata_probewise_diff %>%
+  distinct(patient, cohort_label) %>%
+  ggplot(aes(
+    y = 1,
+    x = patient,
+    fill = cohort_label
+  )) +
+  geom_tile() +
+  scale_fill_brewer(palette = 'Set1') +
+  theme_void() +
+  theme(
+    axis.title.y = element_text(),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = 'Cohort',
+    fill = 'Cohort'
+  )
+
+plot_colorbar_probewise_diff_response <- plotdata_probewise_diff %>%
+  distinct(patient, best_response) %>%
+  ggplot(aes(
+    y = 1,
+    x = patient,
+    fill = best_response 
+  )) +
+  geom_tile() +
+  scale_fill_brewer(palette = 'RdBu') +
+  theme_void() +
+  theme(axis.title.y = element_text()) +
+  labs(
+    y = 'Response',
+    fill = 'Response'
+  )
+
+# ----------------------------------------- #
+# Barplot showing the total delta CSM score #
+# ----------------------------------------- #
+
+p_bar_delta_csm <- pd_delta_csm %>%
+  filter(timepoint == 'C3B') %>%
+  mutate(patient = factor(as.character(patient), levels = vector_patient_probewise_diff_order)) %>%
+  arrange(patient) %>%
+  ggplot(aes(
+    y = delta_csm,
+    x = patient,
+    fill = cohort
+  )) +
+  geom_bar(stat = 'identity') +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    axis.title.y = element_text(angle = 0, vjust=0.5),
+  ) +
+  labs(
+    y = '\u0394CSM',
+    x = 'Patient'
+  ) +
+  scale_fill_brewer(palette = 'Set1')
+
+
+# -------------------------------------- #
+# Plotting KM curves for response by CSM #
+# -------------------------------------- #
+
+plotdata_cfmedip_response <- df_csm %>%
+  dplyr::rename(cfMeDIP = score) %>%
+  select(cohort, patient, timepoint, cfMeDIP) %>%
+  filter(timepoint %in% c('SB', 'C3B')) %>%
+  spread(timepoint, cfMeDIP) %>%
+  filter(!is.na(SB), !is.na(C3B)) %>%
+  mutate(
+    cfmedip_diff = (C3B - SB),
+    change = case_when(
+      C3B > SB ~ 'Increase',
+      SB > C3B ~ 'Decrease',
+      SB == C3B ~ 'Same'
+    ),
+    change = factor(change, levels = c('Increase', 'Decrease'))
+  ) %>%
+  inner_join(df_natera_response %>% distinct(patient, change_ctDNA, `change_ctDNA group`)) %>%
+  dplyr::rename(change_group_natera = `change_ctDNA group`) %>%
+  mutate(change_group_natera = factor(gsub(' from baseline', '', change_group_natera), levels = c('Increase', 'Decrease'))) %>%
+  filter(
+    !is.na(change),
+    !is.na(change_group_natera)
+  ) %>%
+  left_join(
+    df_natera_timepoint %>%
+      spread(timepoint, natera) %>%
+      dplyr::rename(natera_C3B = C3B, natera_SB = SB)
+  ) %>%
+  mutate(
+    cfmedip_log_foldchange = log10(1 + C3B) - log10(1 + SB),
+    ctdna_log_foldchange = log10(1 + natera_C3B) - log10(1 + natera_SB),
+    Agreement = cfmedip_log_foldchange * ctdna_log_foldchange > 0,
+    quadrant = sprintf('CSM: %s, CMC: %s', change, change_group_natera)
+  ) %>%
+  inner_join(df_biomarkers %>% mutate(pdl1_fraction = pdl1_percent / 100) %>% select(-pdl1_percent)) %>%
+  inner_join(df_clinical)
+
+# --------------------------------------------- #
+# Kaplan meier plots of delta CSM and delta CMC #
+# --------------------------------------------- #
+
+plot_pfs_cfmedip_withlegend <- plotdata_cfmedip_response %>%
+  distinct(
+    patient,
+    time = pfs_since_C3,
+    event = pfs_event,
+    change = change,
+    cohort = cohort,
+  ) %>%
+  get_survplot(title = 'CSM - PFS', legend = 'right', cowplot=FALSE) +
+  labs(y = 'PFS')
+
+plot_pfs_cfmedip <- plotdata_cfmedip_response %>%
+  distinct(
+    patient,
+    time = pfs_since_C3,
+    event = pfs_event,
+    change = change,
+    cohort = cohort,
+  ) %>%
+  get_survplot(title = 'CSM - PFS', legend = 'none', getfit=T)
+
+plot_os_cfmedip <- plotdata_cfmedip_response %>%
+  distinct(
+    patient,
+    time = os_since_C3,
+    event = death,
+    change = change,
+    cohort = cohort,
+  ) %>%
+  get_survplot(title = 'CSM - OS', legend = 'none', getfit=T)
+
+plot_pfs_natera <- plotdata_cfmedip_response %>%
+  distinct(
+    patient,
+    time = pfs_since_C3,
+    event = pfs_event,
+    change = change_group_natera,
+    cohort = cohort,
+  ) %>%
+  get_survplot(title = 'CMC - PFS', legend = 'none', getfit=T)
+
+plot_os_natera <- plotdata_cfmedip_response %>%
+  distinct(
+    patient,
+    time = os_since_C3,
+    event = death,
+    change = change_group_natera,
+    cohort = cohort,
+  ) %>%
+  get_survplot(title = 'CMC - OS', legend = 'none', getfit=T)
+
+# -------------------------------------------------------------- #
+# Scatterplot showing aggreement between delta CSM and delta CMC #
+# -------------------------------------------------------------- #
+
+plot_change_ctdna_cfmedip <- plotdata_cfmedip_response %>%
+  ggplot(aes(
+    x = ctdna_log_foldchange,
+    y = cfmedip_log_foldchange,
+    color = Agreement
+  )) +
+  geom_vline(xintercept = 0, color = 'black', size = 0.2) +
+  geom_hline(yintercept = 0, color = 'black', size = 0.2) +
+  geom_point() +
+  labs(
+    x = 'CMC (log fold change)',
+    y = 'CSM (log fold change)'
+  ) +
+  scale_color_brewer(palette = 'Set1') +
+  ggtitle('Change from SB to C3B')
+
+# ------------------------------- #
+# KM plot of CSM and CMC together #
+# ------------------------------- #
+
+plotlegend_cfmedip_response <- plotdata_cfmedip_response %>%
+  select(
+    patient,
+    time = os_since_C3,
+    event = death,
+    change = quadrant,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  title = 'Combined - OS', legend = 'right', ahrstring = F, cowplot = F
+) %>%
+  .$plot %>%
+  get_legend()
+
+# ----------------------------------- #
+# Cox multivariate model forest plots #
+# ----------------------------------- #
+
+plotdata_mva_forest <- plotdata_cfmedip_response %>%
+  dplyr::rename(
+    `CSM change` = change,
+    `CMC change` = change_group_natera,
+    `PD-L1 fraction` = pdl1_fraction,
+    `log(TMB)` = log_tmb,
+    `Study Cohort` = cohort_label
+  )
+
+cox_delta_csm_cmc_os <- coxph(
+  Surv(os_since_C3, death) ~ `CSM change` + `CMC change` + cohort,
+  data = plotdata_mva_forest
+)
+
+val_combined_os_csm_ahr <- ratio_to_string(exp(coef(cox_delta_csm_cmc_os)[1]))
+val_combined_os_csm_ahr_lci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_os)[1, 1]))
+val_combined_os_csm_ahr_uci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_os)[1, 2]))
+val_combined_os_csm_ahr_p <- pval_to_string(summary(cox_delta_csm_cmc_os)$coefficients[1, 5])
+val_combined_os_cmc_ahr <- ratio_to_string(exp(coef(cox_delta_csm_cmc_os)[2]))
+val_combined_os_cmc_ahr_lci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_os)[2, 1]))
+val_combined_os_cmc_ahr_uci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_os)[2, 2]))
+val_combined_os_cmc_ahr_p <- pval_to_string(summary(cox_delta_csm_cmc_os)$coefficients[2, 5])
+
+ahrstring_os <- sprintf(
+  'CSM: aHR = %s (%s - %s), %s\nCMC: aHR = %s (%s - %s), %s',
+  val_combined_os_csm_ahr,
+  val_combined_os_csm_ahr_lci,
+  val_combined_os_csm_ahr_uci,
+  val_combined_os_csm_ahr_p,
+  val_combined_os_cmc_ahr,
+  val_combined_os_cmc_ahr_lci,
+  val_combined_os_cmc_ahr_uci,
+  val_combined_os_cmc_ahr_p
+)
+
+plot_km_combined_os <- plotdata_cfmedip_response %>%
+  select(
+    patient,
+    time = os_since_C3,
+    event = death,
+    change = quadrant,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  title = 'Combined - OS', legend = 'none', ahrstring = ahrstring_os
+)
+
+cox_delta_csm_cmc_pfs <- coxph(
+  Surv(pfs_since_C3, death) ~ `CSM change` + `CMC change` + cohort,
+  data = plotdata_mva_forest
+)
+
+val_combined_pfs_csm_ahr <- ratio_to_string(exp(coef(cox_delta_csm_cmc_pfs)[1]))
+val_combined_pfs_csm_ahr_lci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_pfs)[1, 1]))
+val_combined_pfs_csm_ahr_uci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_pfs)[1, 2]))
+val_combined_pfs_csm_ahr_p <- pval_to_string(summary(cox_delta_csm_cmc_pfs)$coefficients[1, 5])
+val_combined_pfs_cmc_ahr <- ratio_to_string(exp(coef(cox_delta_csm_cmc_pfs)[2]))
+val_combined_pfs_cmc_ahr_lci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_pfs)[2, 1]))
+val_combined_pfs_cmc_ahr_uci <- ratio_to_string(exp(confint(cox_delta_csm_cmc_pfs)[2, 2]))
+val_combined_pfs_cmc_ahr_p <- pval_to_string(summary(cox_delta_csm_cmc_pfs)$coefficients[2, 5])
+
+ahrstring_pfs <- sprintf(
+  'CSM: aHR = %s (%s - %s), %s\nCMC: aHR = %s (%s - %s), %s',
+  val_combined_pfs_csm_ahr,
+  val_combined_pfs_csm_ahr_lci,
+  val_combined_pfs_csm_ahr_uci,
+  val_combined_pfs_csm_ahr_p,
+  val_combined_pfs_cmc_ahr,
+  val_combined_pfs_cmc_ahr_lci,
+  val_combined_pfs_cmc_ahr_uci,
+  val_combined_pfs_cmc_ahr_p
+)
+
+plot_km_combined_pfs <- plotdata_cfmedip_response %>%
+  select(
+    patient,
+    time = pfs_since_C3,
+    event = pfs_event,
+    change = quadrant,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  title = 'Combined - PFS', legend = 'none', ahrstring = ahrstring_pfs
+)
+
+plot_km_combined_withlegend <- plotdata_cfmedip_response %>%
+  select(
+    patient,
+    time = pfs_since_C3,
+    event = pfs_event,
+    change = quadrant,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  legend = 'right', ahrstring = ahrstring_pfs, cowplot=F
+)
+
+p_legend_km_combined <- crossing(
+  CSM = factor(c('\u2191', '\u2193'), levels = c('\u2193', '\u2191')),
+  CMC = factor(c('\u2191', '\u2193'), levels = c('\u2193', '\u2191'))
+) %>%
+  mutate(group = c('A', 'B', 'C', 'D')) %>%
+  ggplot() +
+  geom_segment(
+    aes(
+      x = as.numeric(CSM) - 0.3,
+      xend = as.numeric(CSM) + 0.3,
+      y = as.numeric(CMC),
+      yend = as.numeric(CMC),
+      color = group
+    ),
+    size = 2
+  ) +
+  scale_x_continuous(
+    breaks = c(1,2),
+    labels = c('\u2193', '\u2191'),
+    limits = c(0.5, 2.5)
+  ) +
+  scale_y_continuous(
+    breaks = c(1,2),
+    labels = c('\u2193', '\u2191'),
+    limits = c(0.75, 2.25)
+  ) +
+  labs(
+    x = 'CSM',
+    y = 'CMC'
+  ) +
+  scale_color_brewer(palette = 'Set1', guide=FALSE) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text.x = element_text(size = 18, face='bold'),
+    axis.text.y = element_text(size = 18, face='bold'),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+  ) +
+  ggtitle('Legend')
+
+# ---------- #
+# Cox models #
+# ---------- #
+
+plotdata_mva_cox <- plotdata_mva_forest %>%
+  dplyr::rename(
+    `delta CSM` = `CSM change`,
+    `delta CMC` = `CMC change`
+  )
+
+cox_pfs_csm <- coxph(
+  Surv(pfs_since_C3, pfs_event) ~ `delta CSM` + `Study Cohort` + `PD-L1 fraction` + `log(TMB)`,
+  data = plotdata_mva_cox
+)
+p_csm_cox_pfs <- cox_pfs_csm %>%
+  forestmodel::forest_model(recalculate_width = 9) +
+  ggtitle('    Cox model, outcome: PFS')
+
+cox_os_csm <- coxph(
+  Surv(os_since_C3, death) ~ `delta CSM` + `Study Cohort` + `PD-L1 fraction` + `log(TMB)`,
+  data = plotdata_mva_cox
+)
+p_csm_cox_os <- cox_os_csm %>%
+  forestmodel::forest_model(recalculate_width = 9) +
+  ggtitle('    Cox model, outcome: PFS')
+
+# ------------------- #
+# Assemble the figure #
+# ------------------- #
+
+pg_delta_csm_heatmap <- plot_grid(
+  p_bar_delta_csm + theme(legend.position = 'none'),
+  plot_colorbar_probewise_diff_cohort + theme(legend.position = 'none'),
+  NULL,
+  plot_colorbar_probewise_diff_response + theme(legend.position = 'none'),
+  plot_heatmap_probewise_diff + theme(legend.position = 'none'),
+  ncol = 1,
+  align = 'v',
+  rel_heights = c(5, 0.7, 0.1, 0.7, 8)
+)
+
+pg_legend_heatmap <-plot_grid(
+  get_legend(plot_heatmap_probewise_diff + theme(legend.position = 'bottom')),
+  get_legend(
+    plot_colorbar_probewise_diff_cohort +
+      theme(legend.position = 'bottom') +
+      guides(fill=guide_legend(ncol=2,byrow=TRUE))
+  ),
+  get_legend(plot_colorbar_probewise_diff_response + theme(legend.position = 'bottom')),
+  ncol = 1,
+  align = 'v',
+  rel_heights = c(1,2,1)
+)
+
+pg_csm_survplots <- plot_grid(
+  plot_pfs_cfmedip$survplot + labs(y = 'PFS'), NULL,
+  plot_os_cfmedip$survplot + labs(y = 'OS'),
+  plot_pfs_natera$survplot + labs(y = 'PFS'), NULL,
+  plot_os_natera$survplot + labs(y = 'OS'),
+  ncol = 2,
+  byrow = F,
+  rel_heights = c(10,1,10),
+  rel_widths = c(3, 3, 1),
+  labels = c('B')
+)
+
+pg_km_survplot_combined <- plot_grid(
+  NULL,
+  plot_km_combined_pfs,
+  plot_km_combined_os,
+  ncol = 1,
+  labels = c('', 'D'),
+  rel_heights = c(1,8,8)
+)
+
+plot_grid(
+  get_legend(
+    plot_pfs_cfmedip_withlegend$plot +
+      theme(
+        legend.position = 'top',
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14)
+      )
+  ),
+  pg_csm_survplots,
+  ncol = 1,
+  rel_heights = c(1, 16)
+) %>%
+  plot_grid(
+    plot_grid(
+      NULL, 
+      pg_delta_csm_heatmap, 
+      pg_legend_heatmap,
+      ncol = 1, 
+      rel_heights = c(1, 16, 8),
+      labels = c('', 'A')
+    ),
+    NULL,
+    .,
+    plot_grid(
+      pg_km_survplot_combined,
+      plot_grid(NULL, p_legend_km_combined, NULL, ncol = 1, rel_heights = c(2,1,2)),
+      nrow = 1,
+      rel_widths = c(5,1.5)
+    ),
+    nrow = 1,
+    rel_widths = c(3, 0.4, 5, 4.5)
+  ) %>%
+  plot_grid(
+    NULL,
+    plot_grid(
+      p_csm_cox_pfs,
+      p_csm_cox_os,
+      nrow = 1,
+      labels = c('C')
+    ),
+    ncol = 1,
+    rel_heights = c(6, 0.2, 3.5)
+  )
+```
+
+
+# Figure 4
+
+```{r jointmodel, fig.width = 15, fig.height = 8}
+# Fragment length alone
+
+plotdata_diff_fragment_score_tcga <- df_fls %>%
+  left_join(df_samples) %>%
+  select(-sample, -library) %>%
+  filter(timepoint %in% c('SB', 'C3B')) %>%
+  spread(timepoint, fragment_score) %>%
+  mutate(
+    diff_fragment_score = C3B - SB,
+    diff_group_fragment_score = if_else(diff_fragment_score > 0, 'Increase', 'Decrease') %>%
+      factor(levels = c('Increase', 'Decrease'))
+  ) %>%
+  filter(!is.na(diff_group_fragment_score))
+
+plotdata_delta_csm <- df_csm %>%
+  select(cohort, patient, timepoint, score) %>%
+  filter(timepoint %in% c('SB', 'C3B')) %>%
+  spread(timepoint, score) %>%
+  mutate(
+    delta_csm = C3B - SB,
+    csm_group = if_else(delta_csm > 0, 'Increase', 'Decrease') %>% factor(levels = c('Increase', 'Decrease')),
+    log_foldchange_csm = log(C3B / SB)
+  ) %>%
+  filter(!is.na(delta_csm))
+
+plotdata_diff_fs_csm <- plotdata_diff_fragment_score_tcga %>%
+  left_join(plotdata_delta_csm, by = c('cohort', 'patient')) %>%
+  left_join(df_clinical)
+
+p_fls_survplot_legend <- ((plotdata_diff_fs_csm %>%
+  select(
+    patient,
+    cohort,
+    event = death,
+    time = os_since_C3,
+    change = diff_group_fragment_score
+  ) %>%
+  get_survplot(legend = 'right', cowplot = F) %>%
+  .$plot) + labs(color = 'Fragment length\nscore (FLS)') ) %>%
+  get_legend()
+
+pfit_fls_survplot_os <- plotdata_diff_fs_csm %>%
+  select(
+    patient,
+    cohort,
+    event = death,
+    time = os_since_C3,
+    change = diff_group_fragment_score
+  ) %>%
+  get_survplot(
+    legend = 'none',
+    ylab =  'OS',
+    getfit = T
+  )
+
+p_fls_survplot_os <- pfit_fls_survplot_os$survplot +
+  labs(
+    y = 'OS'
+  )
+
+pfit_fls_survplot_pfs <- plotdata_diff_fs_csm %>%
+  select(
+    patient,
+    cohort,
+    event = pfs_event,
+    time = pfs_since_C3,
+    change = diff_group_fragment_score
+  ) %>%
+  get_survplot(
+    legend = 'none',
+    ylab = 'PFS',
+    getfit = T
+  )
+
+p_fls_survplot_pfs <- pfit_fls_survplot_pfs$survplot +
+  labs(
+    y = 'PFS'
+  )
+
+# ------------------ #
+# Kaplan-meier plots #
+# ------------------ #
+
+p_fls_csm_survplot_legend <- plotdata_diff_fs_csm %>%
+  mutate(
+    quadrant = sprintf('CSM: %s / FLS: %s', csm_group, diff_group_fragment_score)
+  ) %>%
+  select(
+    patient,
+    cohort,
+    event = pfs_event,
+    time = pfs_since_C3,
+    change = quadrant
+  ) %>%
+  get_survplot(
+    ahrstring = FALSE,
+    legend = 'right',
+    cowplot = F
+  ) %>%
+  get_legend()
+
+p_fls_csm_survplot_pfs <- plotdata_diff_fs_csm %>%
+  mutate(
+    quadrant = sprintf('CSM: %s / FLS: %s', csm_group, diff_group_fragment_score)
+  ) %>%
+  select(
+    patient,
+    cohort,
+    event = pfs_event,
+    time = pfs_since_C3,
+    change = quadrant
+  ) %>%
+  get_survplot(
+    ahrstring = FALSE,
+    legend = 'none',
+    ylab = 'PFS'
+  )
+
+p_fls_csm_survplot_os <- plotdata_diff_fs_csm %>%
+  mutate(
+    quadrant = sprintf('CSM: %s / FS: %s', csm_group, diff_group_fragment_score)
+  ) %>%
+  select(
+    patient,
+    cohort,
+    event = death,
+    time = os_since_C3,
+    change = quadrant
+  ) %>%
+  get_survplot(
+    ahrstring = FALSE,
+    legend = 'none',
+    ylab = 'OS'
+  )
+
+# ---------------------- #
+# Cox model forest plots #
+# ---------------------- #
+
+cox_fragment_csm_os <- coxph(
+  Surv(os_since_C3, death) ~ `FLS change` + `CSM change` + cohort,
+  data = plotdata_diff_fs_csm %>%
+    dplyr::rename(
+      `FLS change` = diff_group_fragment_score,
+      `CSM change` = csm_group
+    )
+)
+
+cox_fragment_csm_pfs <- coxph(
+  Surv(pfs_since_C3, pfs_event) ~ `FLS change` + `CSM change` + cohort,
+  data = plotdata_diff_fs_csm %>%
+    dplyr::rename(
+      `FLS change` = diff_group_fragment_score,
+      `CSM change` = csm_group
+    )
+)
+
+
+
+p_legend_km_jointmodel <- crossing(
+  CSM = factor(c('\u2191', '\u2193'), levels = c('\u2193', '\u2191')),
+  FLS = factor(c('\u2191', '\u2193'), levels = c('\u2193', '\u2191'))
+) %>%
+  mutate(group = c('A', 'B', 'C', 'D')) %>%
+  ggplot() +
+  geom_segment(
+    aes(
+      x = as.numeric(CSM) - 0.3,
+      xend = as.numeric(CSM) + 0.3,
+      y = as.numeric(FLS),
+      yend = as.numeric(FLS),
+      color = group
+    ),
+    size = 2
+  ) +
+  scale_x_continuous(
+    breaks = c(1,2),
+    labels = c('\u2193', '\u2191'),
+    limits = c(0.5, 2.5)
+  ) +
+  scale_y_continuous(
+    breaks = c(1,2),
+    labels = c('\u2193', '\u2191'),
+    limits = c(0.75, 2.25)
+  ) +
+  labs(
+    x = 'CSM',
+    y = 'FLS'
+  ) +
+  scale_color_brewer(palette = 'Set1', guide=FALSE) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    axis.text.x = element_text(size = 15, face='bold'),
+    axis.text.y = element_text(size = 15, face='bold'),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+  ) +
+  ggtitle('Legend')
+
+# ------------------- #
+# Assemble the figure #
+# ------------------- #
+
+plot_grid(
+  plot_grid(
+    plot_grid(
+      plot_grid(
+        p_fls_survplot_legend,
+        NULL,
+        p_legend_km_jointmodel,
+        NULL,
+        rel_widths = c(2,0.5,1,0.5),
+        nrow = 1
+      ),
+      plot_grid(
+        p_fls_survplot_os,
+        p_fls_survplot_pfs,
+        p_fls_csm_survplot_os,
+        p_fls_csm_survplot_pfs,
+        align = 'v',
+        ncol = 2,
+        byrow = F,
+        labels = c('A', 'B')
+      ),
+      ncol = 1,
+      rel_heights = c(1,5)
+    ),
+    plot_grid(
+      NULL,
+      plot_grid(
+        cox_fragment_csm_os %>%
+          forest_model(
+            recalculate_width = 8
+          ) + ggtitle('Overall Survival'),
+        cox_fragment_csm_pfs %>%
+          forest_model(recalculate_width = 8) +
+          ggtitle('Progression-free Survival'),
+        ncol = 1
+      ),
+      nrow = 1,
+      rel_widths = c(1,20),
+      labels = c('C')
+    ),
+    nrow = 1,
+    rel_widths = c(4,5)
+  )
+)
+
+```
+
+
+# Figure 5
+
+```{r clearance, fig.width = 10, fig.height = 9}
+
+# ----------------------------- #
+# Clearance comparison tileplot #
+# ----------------------------- #
+
+pd_glmprediction_clearance_category <- pd_csm_fls_by_group_glmprediction %>%
+  mutate(
+    clearance_sample = prediction < v_clearance_optimal_threshold
+  ) %>%
+  group_by(patient) %>%
+  filter('SB' %in% timepoint & any(timepoint != 'SB')) %>%
+  mutate(
+    baseline_value = prediction[timepoint == 'SB'],
+    change_from_baseline = prediction - baseline_value
+  ) %>%
+  filter(timepoint != 'SB') %>%
+  summarise(
+    earliest_on_treatment = timepoint[as.integer(timepoint) == min(as.integer(timepoint))],
+    clearance_group_glm = case_when(
+      any(clearance_sample) ~ 'Clearance',
+      change_from_baseline[timepoint == earliest_on_treatment] < 0 ~ 'Decrease',
+      change_from_baseline[timepoint == earliest_on_treatment] > 0 ~ 'Increase'
+    ),
+    earliest_clearance = ifelse(
+      any(clearance_sample),
+      levels(timepoint)[min(as.integer(timepoint[clearance_sample]))],
+      NA
+    )
+  )
+
+p_clearance_cfmedip_cmc_comparison <- df_clearance_natera %>%
+  select(patient, clearance_natera = log10_change_ctDNA) %>%
+  distinct() %>%
+  left_join(pd_glmprediction_clearance_category) %>%
+  filter(
+    clearance_group_glm %in% c('Increase', 'Decrease', 'Clearance')
+  ) %>%
+  count(clearance_group_glm, clearance_natera) %>%
+  mutate(
+    group = case_when(
+      clearance_group_glm == 'Decrease' & clearance_natera == 'Clearance' ~ 'Clearance - CMC only',
+      clearance_group_glm == 'Clearance' & clearance_natera == 'Decrease' ~ 'Clearance - cfMeDIP only',
+      clearance_group_glm == 'Clearance' & clearance_natera == 'Clearance' ~ 'Clearance - both methods',
+      clearance_group_glm == 'Decrease' ~ 'cfMeDIP decrease',
+      clearance_group_glm == 'Increase' ~ 'cfMeDIP increase',
+      TRUE ~ 'Other'
+    ) %>% factor(
+      levels = c(
+        'Clearance - both methods',
+        'Clearance - cfMeDIP only',
+        'Clearance - CMC only',
+        'cfMeDIP decrease',
+        'cfMeDIP increase'
+      )
+    )
+  ) %>%
+  ggplot(aes(
+    x = clearance_group_glm,
+    y = clearance_natera,
+    fill = group,
+    label = n
+  )) +
+  geom_tile() +
+  geom_text() +
+  labs(
+    x = 'cfMeDIP-seq kinetics',
+    y = 'CMC kinetics',
+    fill = 'Category' 
+  ) +
+  scale_fill_manual(values = c(
+    brewer.pal(3, 'Set1')[3],
+    brewer.pal(3, 'Set2')[c(2, 1)],
+    brewer.pal(3, 'Pastel1')[c(2, 1)]
+  )) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+# ------------------------------------ #
+# Clearance by timepoint - spider plot #
+# ------------------------------------ #
+
+pd_clearance_comparison_by_timepoint <- pd_glmprediction_clearance_category %>%
+  left_join(pd_glmprediction_by_timepoint) %>%
+  filter(!is.na(clearance_group_glm)) %>%
+  left_join(df_clearance_natera %>% distinct(patient, log10_change_ctDNA)) %>%
+  mutate(
+    clearance_group = case_when(
+      is.na(log10_change_ctDNA) ~ clearance_group_glm,
+      log10_change_ctDNA == 'Clearance' & clearance_group_glm != 'Clearance' ~ 'Clearance - CMC only',
+      log10_change_ctDNA != 'Clearance' & clearance_group_glm == 'Clearance' ~ 'Clearance - cfMeDIP only',
+      log10_change_ctDNA == 'Clearance' & clearance_group_glm == 'Clearance' ~ 'Clearance - both methods',
+      TRUE ~ clearance_group_glm
+    ) %>%
+      factor(
+        levels = c(
+          'Clearance - both methods',
+          'Clearance - cfMeDIP only',
+          'Clearance - CMC only',
+          'Decrease',
+          'Increase'
+        )
+      ),
+    clearance_method = case_when(
+      clearance_group == 'Clearance - CMC only' ~ 'Cleared by one method',
+      clearance_group == 'Clearance - cfMeDIP only' ~ 'Cleared by one method',
+      clearance_group == 'Clearance - both methods' ~ 'Cleared by both methods',
+      TRUE ~ 'No clearance'
+    )
+  )
+
+p_clearance_by_timepoint <- pd_clearance_comparison_by_timepoint %>%
+  ggplot(aes(
+    x = timepoint_numeric,
+    y = prediction,
+    color = clearance_group
+  )) +
+  geom_line(
+    aes(
+      group = patient,
+      size = clearance_group
+    )
+  ) +
+  geom_point(size = 2) +
+  geom_hline(
+    yintercept = v_clearance_optimal_threshold,
+    size = 1,
+    color = 'Black'
+  ) +
+  geom_line(
+    aes(
+      group = patient,
+      size = clearance_group
+    ),
+    data = pd_clearance_comparison_by_timepoint %>%
+      filter(clearance_method == 'Cleared by one method')
+  ) +
+  geom_point(
+    size = 2,
+    data = pd_clearance_comparison_by_timepoint %>%
+      filter(clearance_method == 'Cleared by one method')
+  ) +
+  scale_color_manual(
+    values = c(
+      brewer.pal(3, 'Set1')[3],
+      brewer.pal(3, 'Set2')[c(2, 1)],
+      brewer.pal(3, 'Pastel1')[c(2, 1)]
+    )
+  ) +
+  scale_size_manual(values = c(0.5, 1.5, 1.5, 0.5, 0.5)) +
+  scale_x_continuous(
+    breaks = pd_glmprediction_by_timepoint$timepoint_numeric %>% unique %>% sort,
+    labels = if_else(
+      levels(pd_glmprediction_by_timepoint$timepoint) %in% c('SB', 'C3B', 'EOTB'),
+      levels(pd_glmprediction_by_timepoint$timepoint),
+      ''
+    )
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  facet_wrap(~ clearance_method) +
+  labs(
+    x = 'Timepoint',
+    color = 'Kinetics',
+    size = 'Kinetics',
+    y = 'cfMeDIP-seq score'
+  ) +
+  geom_text_repel(
+    aes(
+      x = label_timepoint,
+      y = label_prediction,
+      label = patient
+    ),
+    data = pd_clearance_comparison_by_timepoint %>%
+      filter(clearance_method == 'Cleared by one method') %>%
+      group_by(patient, clearance_method) %>%
+      summarise(
+        label_timepoint = if_else(clearance_group == 'Clearance - CMC only', max(timepoint_numeric), 0),
+        label_prediction = if_else(
+          clearance_group == 'Clearance - CMC only',
+          prediction[timepoint_numeric == max(timepoint_numeric)],
+          prediction[timepoint_numeric == 0]
+        )
+      ) %>%
+      ungroup() %>%
+      distinct(),
+    nudge_x = 1,
+    nudge_y = 4,
+    seed = 10,
+    show_guide = FALSE,
+    color = 'black',
+    min.segment.length = 0
+  ) +
+  scale_y_continuous(
+    breaks = c(-2, v_clearance_optimal_threshold, 0, 2),
+    labels = c(
+      '-2',
+      sprintf('Threshold:\n%s', round(v_clearance_optimal_threshold, 4)),
+      '0',
+      '2'
+    )
+  )
+
+
+# ------------------------------- #
+# Patient clinical timeline plots #
+# ------------------------------- #
+
+pd_clearance_clinical <- pd_clearance_comparison_by_timepoint %>%
+  distinct(patient, clearance_group_glm, clearance_group) %>%
+  left_join(df_clinical)
+
+patients_with_clearance <- unique((pd_clearance_clinical %>% filter(startsWith(as.character(clearance_group), 'Clearance')))$patient)
+
+pd_cohort_pfs <- df_clinical %>%
+  group_by(cohort) %>%
+  summarise(
+    median_pfs = median(pfs_months),
+    max_pfs = max(pfs_months),
+    n_clear = sum(patient %in% patients_with_clearance)
+  ) %>%
+  ungroup() %>%
+  filter(n_clear > 0)
+
+pd_clearance_event_times <- bind_rows(
+  df_clinical %>%
+    filter(patient %in% patients_with_clearance) %>%
+    filter(pfs_event) %>%
+    filter(!death | pfs_months != os_months) %>%
+    distinct(
+      patient, months = pfs_months, cohort
+    ) %>%
+    mutate(event = 'Progression'),
+  df_clinical %>%
+    filter(patient %in% patients_with_clearance) %>%
+    filter(death) %>%
+    distinct(
+      patient, months = os_months, cohort
+    ) %>%
+    mutate(event = 'Death')
+)
+
+p_cleared_patient_timeline <- df_recist %>%
+  filter(patient %in% patients_with_clearance) %>%
+  mutate(cohort = gsub('(.*?-.)-.*', '\\1', patient)) %>%
+  ggplot() +
+  geom_segment(
+    aes(
+      x = 0,
+      xend = months_to_last_pembro,
+      y = patient,
+      yend = patient,
+      size = treated
+    ),
+    data = df_clinical %>%
+      filter(patient %in% patients_with_clearance) %>%
+      mutate(treated = 'Receiving\npembrolizumab'),
+    color = 'Yellow'
+  ) +
+  scale_size_manual(values = 3) +
+  geom_segment(
+    mapping = aes(
+      x = 0,
+      xend = os_months,
+      y = patient,
+      yend = patient
+    ),
+    data = df_clinical %>%
+      filter(patient %in% patients_with_clearance),
+    size = 0.5,
+    color = 'black'
+  ) +
+  geom_segment(
+    aes(
+      x = median_pfs,
+      xend = median_pfs,
+      y = 0.5,
+      yend = n_clear + 1
+    ),
+    data = pd_cohort_pfs %>%
+      ungroup() %>%
+      filter(n_clear > 0),
+    color = 'Grey70'
+  ) +
+  geom_segment(
+    aes(
+      x = max_pfs,
+      xend = max_pfs,
+      y = 0.5,
+      yend = n_clear + 1
+    ),
+    data = pd_cohort_pfs,
+    color = 'Grey70'
+  ) +
+  scale_fill_distiller(palette = 'RdBu', limits=c(-100,100)) +
+  geom_point(
+    mapping = aes(
+      x = months,
+      y = patient,
+      shape = event
+    ),
+    data = pd_clearance_event_times,
+    size = 4,
+    color = 'black'
+  ) +
+  scale_shape_manual(values = c(15, 17)) +
+  geom_point(
+    mapping = aes(
+      x = months_to_recist,
+      y = patient,
+      fill = percent
+    ),
+    size = 2,
+    shape = 21,
+    color = 'black'
+  ) +
+  facet_grid(cohort ~ ., scales = 'free_y', space = 'free_y') +
+  labs(
+    x = 'Months since first pembrolizumab',
+    y = 'Patient',
+    size = 'Treatment',
+    fill = 'Target lesion size\n(% change from\nbaseline)',
+    shape = 'Event'
+  ) +
+  geom_text(
+    aes(
+      y = patient,
+      x = -1,
+      label = cleared_by
+    ),
+    pd_clearance_clinical %>%
+      filter(patient %in% patients_with_clearance) %>%
+      mutate(
+        cleared_by = case_when(
+          clearance_group == 'Clearance - CMC only' ~ 'CMC only',
+          clearance_group == 'Clearance - cfMeDIP only' ~ 'cfMeDIP only',
+          clearance_group == 'Clearance - both methods' ~ 'Both cleared'
+        )
+      ),
+    hjust = 1
+  ) +
+  xlim(
+    -15, max(df_clinical %>% filter(patient %in% patients_with_clearance) %>% .$os_months)
+  ) +
+  geom_point(
+    aes(
+      x = median_pfs,
+      y = n_clear + 2
+    ),
+    size = 0,
+    data = pd_cohort_pfs
+  ) +
+  geom_text(
+    aes(
+      x = value,
+      y = n_clear + 1.5,
+      label = metric
+    ),
+    data = pd_cohort_pfs %>%
+      dplyr::rename(`Median` = median_pfs, `Max` = max_pfs) %>%
+      gather(metric, value, `Median`, `Max`),
+    size = 3.5,
+    color = 'Grey50'
+  ) +
+  geom_text(
+    aes(
+      x = -3,
+      y = n_clear + 1.5,
+      label = 'Cohort PFS:'
+    ),
+    hjust = 1,
+    data = pd_cohort_pfs %>% distinct(cohort, n_clear),
+    size = 3.5,
+    color = 'Grey50'
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = 'bottom'
+  ) +
+  ggtitle('Patients with clearance')
+
+
+# ------------------ #
+# Kaplan-Meier Plots # 
+# ------------------ #
+
+p_km_pfs_cfmedip_kinetics <- pd_clearance_clinical %>%
+  select(
+    patient,
+    cohort,
+    time = pfs_since_C3,
+    event = pfs_event,
+    change = clearance_group_glm
+  ) %>%
+  get_survplot(
+    ylab = 'PFS',
+    ahrstring = F,
+    legend = 'none',
+    color_vector = c('Black', brewer.pal(3, 'Pastel1')[c(2,1)]),
+    risk.table=F
+  )
+
+p_km_os_cfmedip_kinetics <- pd_clearance_clinical %>%
+  select(
+    patient,
+    cohort,
+    time = os_since_C3,
+    event = death,
+    change = clearance_group_glm
+  ) %>%
+  get_survplot(
+    ylab = 'OS',
+    ahrstring = F,
+    legend = 'none',
+    color_vector = c('Black', brewer.pal(3, 'Pastel1')[c(2,1)]),
+    risk.table = F
+  )
+
+p_km_cfmedip_kinetics_legend <- pd_clearance_clinical %>%
+  select(
+    patient,
+    cohort,
+    time = os_since_C3,
+    event = death,
+    change = clearance_group_glm
+  ) %>%
+  get_survplot(
+    ahrstring = F, 
+    legend = 'right',
+    legend_title = 'cfMeDIP-seq kinetics',
+    cowplot = F,
+    color_vector = c('Black', brewer.pal(3, 'Pastel1')[c(2,1)]),
+    risk.table=F
+  ) %>%
+    get_legend()
+
+plot_grid(
+  plot_grid(
+    plot_grid(
+      NULL,
+      p_clearance_cfmedip_cmc_comparison + theme(legend.position = 'none'),
+      NULL,
+      ncol = 1,
+      rel_heights = c(0.5, 4, 0.5)
+    ),
+    NULL,
+    p_clearance_by_timepoint + theme(legend.position = 'none'),
+    nrow = 1,
+    rel_widths = c(1, 0.1, 3),
+    labels = c('A', '', 'B')
+  ),
+  plot_grid(
+    p_cleared_patient_timeline,
+    plot_grid(
+      p_km_pfs_cfmedip_kinetics,
+      NULL,
+      p_km_os_cfmedip_kinetics,
+      NULL,
+      p_km_cfmedip_kinetics_legend,
+      ncol = 1,
+      rel_heights = c(10,-3,10,-2,4)
+    ),
+    nrow = 1,
+    rel_widths = c(2,1),
+    labels = c('C', 'D')
+  ),
+  ncol = 1,
+  rel_heights = c(2,4)
+)
+
+```
+
+
+# Supplemental Figure 1
+
+```{r inspire_sample_tracker, fig.height = 8, fig.width = 15}
+p_samples_by_cohort <- df_csm %>%
+  filter(immune_group == 'Non-immune', !is.na(sample)) %>%
+  distinct(cohort, patient, timepoint, sample) %>%
+  mutate(timepoint = factor(timepoint, levels = levels(df_samples$timepoint))) %>%
+  ggplot(aes(
+    x = timepoint,
+    y = patient 
+  )) +
+  facet_wrap(~cohort, scales = 'free') +
+  geom_point(size = 3) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = 'Timepoint',
+    y = 'Sample'
+  )
+
+plotdata_count_by_timepoint <- df_csm %>%
+  filter(immune_group == 'Non-immune', !is.na(sample)) %>%
+  distinct(cohort, patient, timepoint, sample) %>%
+  mutate(timepoint = factor(timepoint, levels = df_samples$timepoint %>% levels)) %>%
+  count(cohort, timepoint)
+
+p_bar_timepoint_total <- plotdata_count_by_timepoint %>%
+  group_by(timepoint) %>%
+  summarise(
+    cohort = 'Total',
+    n = sum(n)
+  ) %>%
+  ggplot(aes(
+    x = timepoint,
+    y = n
+  )) +
+  geom_bar(stat = 'identity') +
+  geom_text(aes(
+    label = n
+  ), nudge_y = 5) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    y = 'Number of samples',
+    x = 'Timepoint'
+  )
+
+p_dots_timepoint_cohort <- plotdata_count_by_timepoint %>%
+  ggplot(aes(
+    x = timepoint,
+    y = cohort,
+    label = n
+  )) +
+  geom_point(aes(
+    size = n
+  )) +
+  geom_text(nudge_y = 0.3) +
+  scale_size_area(max_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = 'Timepoint',
+    y = 'Cohort'
+  )
+
+plot_grid(
+  p_samples_by_cohort,
+  plot_grid(
+    p_bar_timepoint_total,
+    p_dots_timepoint_cohort + theme(legend.position = 'none'),
+    ncol = 1,
+    align = 'v',
+    rel_heights = c(1,2)
+  ),
+  nrow = 1,
+  rel_widths = c(2,1),
+  labels = c('A', 'B')
+)
+```
+
+
+# Supplemental Figure 2
+
+```{r survival_by_cohort, fig.width = 9, fig.height = 8}
+survfit_os_bycohort <- survfit(
+  Surv(os_months, death) ~ cohort_label,
+  data = df_clinical %>% filter(patient %in% df_samples$patient)
+)
+names(survfit_os_bycohort$strata) <- gsub('cohort_label=', '', names(survfit_os_bycohort$strata))
+
+plot_os_bycohort <- survfit_os_bycohort %>%
+  ggsurvplot(pval = T, pval.coord = c(40, 1)) +
+  labs(y = 'Overall survival')
+
+survfit_pfs_bycohort <- survfit(
+  Surv(pfs_months, pfs_event) ~ cohort_label,
+  data = df_clinical %>% filter(patient %in% df_samples$patient)
+)
+names(survfit_pfs_bycohort$strata) <- gsub('cohort_label=', '', names(survfit_pfs_bycohort$strata))
+
+plot_pfs_bycohort <- survfit_pfs_bycohort %>%
+  ggsurvplot(pval = T, pval.coord = c(40, 1)) +
+  labs(y = 'Progression free survival')
+
+coxph_os_by_cohort <- coxph(
+  Surv(os_months, death) ~ cohort,
+  data = df_clinical %>% filter(patient %in% df_samples$patient)
+)
+
+coxph_pfs_by_cohort <- coxph(
+  Surv(pfs_months, pfs_event) ~ cohort,
+  data = df_clinical %>% filter(patient %in% df_samples$patient)
+)
+
+plot_grid(
+  plot_grid(
+    plot_os_bycohort$plot + theme(legend.position = 'none') + scale_color_brewer(palette = 'Set1'),
+    plot_pfs_bycohort$plot + theme(legend.position = 'none') + scale_color_brewer(palette = 'Set1'),
+    get_legend(plot_os_bycohort$plot + theme(legend.position = 'right') + scale_color_brewer(palette = 'Set1') + labs(color = 'Cohort')),
+    nrow = 1,
+    rel_widths = c(2,2,1)
+  ),
+  plot_grid(
+    NULL,
+    plot_grid(
+      coxph_os_by_cohort %>% forest_model() + ggtitle('OS by cohort'),
+      coxph_pfs_by_cohort %>% forest_model() + ggtitle('PFS by cohort'),
+      ncol = 1
+    ),
+    nrow = 1, rel_widths = c(1, 20)
+  ),
+  ncol = 1,
+  rel_heights = c(7,8),
+  labels = c('A', 'B')
+)
+
+val_cox_os_hr_cohortD <- exp(coef(coxph_os_by_cohort))['cohortINS-D'] %>% ratio_to_string
+val_cox_os_hr_cohortD_lci <- exp(confint(coxph_os_by_cohort))['cohortINS-D', '2.5 %'] %>% ratio_to_string
+val_cox_os_hr_cohortD_uci <- exp(confint(coxph_os_by_cohort))['cohortINS-D', '97.5 %'] %>% ratio_to_string
+val_cox_os_hr_cohortD_p <- coefficients(summary(coxph_os_by_cohort))['cohortINS-D', 'Pr(>|z|)'] %>% pval_to_string
+
+val_cox_pfs_hr_cohortB <- exp(coef(coxph_pfs_by_cohort))['cohortINS-B'] %>% ratio_to_string
+val_cox_pfs_hr_cohortB_lci <- exp(confint(coxph_pfs_by_cohort))['cohortINS-B', '2.5 %'] %>% ratio_to_string
+val_cox_pfs_hr_cohortB_uci <- exp(confint(coxph_pfs_by_cohort))['cohortINS-B', '97.5 %'] %>% ratio_to_string
+val_cox_pfs_hr_cohortB_p <- coefficients(summary(coxph_pfs_by_cohort))['cohortINS-B', 'Pr(>|z|)'] %>% pval_to_string
+
+val_cox_pfs_hr_cohortC <- exp(coef(coxph_pfs_by_cohort))['cohortINS-C'] %>% ratio_to_string
+val_cox_pfs_hr_cohortC_lci <- exp(confint(coxph_pfs_by_cohort))['cohortINS-C', '2.5 %'] %>% ratio_to_string
+val_cox_pfs_hr_cohortC_uci <- exp(confint(coxph_pfs_by_cohort))['cohortINS-C', '97.5 %'] %>% ratio_to_string
+val_cox_pfs_hr_cohortC_p <- coefficients(summary(coxph_pfs_by_cohort))['cohortINS-C', 'Pr(>|z|)'] %>% pval_to_string
+
+val_cox_pfs_hr_cohortD <- exp(coef(coxph_pfs_by_cohort))['cohortINS-D'] %>% ratio_to_string
+val_cox_pfs_hr_cohortD_lci <- exp(confint(coxph_pfs_by_cohort))['cohortINS-D', '2.5 %'] %>% ratio_to_string
+val_cox_pfs_hr_cohortD_uci <- exp(confint(coxph_pfs_by_cohort))['cohortINS-D', '97.5 %'] %>% ratio_to_string
+val_cox_pfs_hr_cohortD_p <- coefficients(summary(coxph_pfs_by_cohort))['cohortINS-D', 'Pr(>|z|)'] %>% pval_to_string
+```
+
+
+# Supplemental Figure 3
+
+```{r clinical_signature_tcgadmr, fig.width = 8, fig.height = 6}
+## Figure Creation
+plotlist_inspire_tcga_zhao <- list()
+
+plotdata_selectcases <- df_csm %>%
+  filter(immune_group == 'Non-immune') %>%
+  left_join(df_samples) %>%
+  arrange(score) %>%
+  filter(sample %in% df_example_coverage$sample) %>%
+  mutate(sample = factor(sample), levels = sample)
+
+df_example_coverage %>%
+  ggplot(aes(
+    x = cpg_count,
+    y = coverage,
+    color = posterior
+  )) +
+  geom_point(alpha=0.5) +
+  facet_wrap(~sample) +
+  scale_color_distiller(palette = 'RdYlBu') +
+  geom_text(aes(
+      x = 0,
+      y = quantile(df_example_coverage$coverage, 0.999) - 5,
+      label = sprintf('cfMeDIP-score: %s', round(score))
+    ),
+    hjust = 0,
+    color = 'black',
+    data = plotdata_selectcases
+  ) +
+  ylim(0, quantile(df_example_coverage$coverage, 0.999)) +
+  labs(
+    x = 'CpG Count',
+    y = 'Bin Coverage (read depth)',
+    color = 'Methylation Probability'
+  )
+```
+
+
+# Supplemental Figure 4
+
+```{r fl_variability, fig.width = 15, fig.height = 10}
+# --------------- #
+# Fragment Ratios #
+# --------------- #
+
+plotdata_fragment_ratio <- df_fragment_ratio %>%
+  mutate(
+    group = if_else(startsWith(library, 'AIX'), 'Normal', 'Cancer')
+  ) %>%
+  mutate(
+    arm = factor(arm, levels = sprintf('%s%s', sort(rep(1:22, 2)), rep(c('p', 'q'), 2)))
+  ) %>%
+  group_by(group, seqnames, arm, start, end) %>%
+  summarise(
+    median = median(ratio_centered),
+    lci_80 = sort(ratio_centered)[round(n() * 0.1)],
+    uci_80 = sort(ratio_centered)[round(n() * 0.9)],
+    lci_95 = sort(ratio_centered)[round(n() * 0.025)],
+    uci_95 = sort(ratio_centered)[round(n() * 0.975)]
+  ) %>%
+  ungroup()
+
+pd_fragment_ratio_var_test <- df_fragment_ratio %>%
+  mutate(
+    group = if_else(startsWith(library, 'AIX'), 'Normal', 'Cancer')
+  ) %>%
+  mutate(
+    arm = factor(arm, levels = sprintf('%s%s', sort(rep(1:22, 2)), rep(c('p', 'q'), 2)))
+  ) %>%
+  group_by(seqnames, arm, start, end) %>%
+  summarise(
+    var_test_p = ansari.test(ratio_centered ~ group)$p.value,
+    var_statistic = ansari.test(ratio_centered ~ group)$statistic,
+    var_test_p_adj = p.adjust(var_test_p, method = 'fdr'),
+    cancer = var(ratio_centered[group == 'Cancer']),
+    normal = var(ratio_centered[group == 'Normal']),
+    more_variable_group = if_else(cancer > normal, 'Cancer', 'Normal')
+  ) %>%
+  ungroup()
+
+pd_fragment_ratio_chr_starts <- plotdata_fragment_ratio %>%
+  mutate(chr_numeric = as.integer(gsub('chr', '', seqnames) %>% as.integer)) %>%
+  group_by(seqnames, chr_numeric) %>%
+  summarise(
+    min_position = min(start),
+    max_position = max(end)
+  ) %>%
+  ungroup() %>%
+  arrange(chr_numeric) %>%
+  mutate(
+    chr_start = cumsum(c(0, max_position[1:(n()-1)])),
+    chr_end = chr_start + max_position - min_position
+  ) %>%
+  left_join(plotdata_fragment_ratio %>% distinct(seqnames, arm))
+
+pd_fragment_ratio_global <- plotdata_fragment_ratio %>%
+  left_join(pd_fragment_ratio_chr_starts) %>%
+  mutate(
+    global_start = start - min_position + chr_start + as.integer(arm) * 100000
+  )
+
+pd_fragment_arms <- pd_fragment_ratio_global %>%
+  distinct(group, seqnames, arm, global_start) %>%
+  group_by(group, seqnames, arm) %>% 
+  summarise(arm_start = min(global_start), arm_end = max(global_start))
+
+pd_fragment_ratio_var_test_global <- pd_fragment_ratio_var_test %>%
+  left_join(pd_fragment_ratio_global) %>%
+  distinct(global_start, seqnames, start, end, cancer, normal, more_variable_group, var_test_p_adj, var_statistic) %>%
+  mutate(global_end = global_start + end - start)
+  
+p_fragment_ratio <- pd_fragment_ratio_global %>%
+  ggplot() +
+  geom_vline(
+    aes(
+      xintercept = arm_start
+    ),
+    data = pd_fragment_arms,
+    size = 0.5,
+    color = 'Grey90'
+  ) +
+  geom_text(
+    aes(
+      x = chr_start,
+      y = 0.065,
+      label = seqnames,
+      group = 0
+    ),
+    data = pd_fragment_arms %>%
+      mutate(seqnames = gsub('chr', '', seqnames)) %>%
+      group_by(seqnames) %>%
+      summarise(chr_start = min(arm_start)) %>%
+      ungroup(),
+    hjust = 0,
+    fontface = 'bold'
+  ) +
+  geom_text(
+    aes(
+      x = arm_start,
+      y = 0.055,
+      label = arm_letter,
+      group = 0
+    ),
+    data = pd_fragment_arms %>% mutate(arm_letter = gsub('\\d', '', arm)),
+    hjust = 0
+  ) +
+  geom_ribbon(aes(
+    group = arm,
+    x = global_start,
+    y = median,
+    ymin = lci_95,
+    ymax = uci_95
+    ),
+    fill = '#EEAAAA') +
+  geom_ribbon(aes(
+    group = arm,
+    x = global_start,
+    y = median,
+    ymin = lci_80,
+    ymax = uci_80
+    ),
+    fill = '#AA7777') +
+  geom_line(
+    aes(
+      group = arm,
+      x = global_start,
+      y = median
+    ),
+    color = 'black'
+  ) +
+  facet_grid(
+    group ~ .,
+    scales = 'free_x',
+    space = 'free_x'
+  ) +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  labs(
+    x = 'Position',
+    y = 'Short-to-long Fragment Ratio\nnormalized & centered',
+  ) +
+  ylim(-0.05, 0.065) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.line.x = element_blank()
+  )
+
+p_var_test_bar <- pd_fragment_ratio_var_test_global %>%
+  mutate(
+    var_diff = log2(cancer / normal),
+    signif_group = if_else(var_test_p_adj < 0.05, more_variable_group, 'No difference')
+  ) %>%
+  ggplot(aes(
+    xmin = global_start,
+    xmax = global_end,
+    ymin = 0,
+    ymax = 1,
+    fill = var_diff
+  )) +
+  geom_rect() +
+  scale_fill_distiller(palette = 'RdBu', limits = c(-3, 3)) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    panel.background = element_blank(),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = 'Position'
+  )
+
+p_var_test_scatter <- pd_fragment_ratio_var_test_global %>%
+  mutate(
+    var_diff = log2(cancer / normal),
+    signif_group = if_else(var_test_p_adj < 0.05, more_variable_group, 'No difference') %>%
+      factor(levels = c('Cancer', 'Normal', 'No difference'))
+  ) %>%
+  ggplot(aes(
+    x = global_start,
+    y = var_diff,
+    color = signif_group
+  )) +
+  geom_point() +
+  scale_color_manual(values = c(brewer.pal(3, 'Set1')[1:2], 'Grey80')) +
+  theme(
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    panel.background = element_blank(),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = 'Position'
+  ) +
+  geom_hline(yintercept = 0, color = 'black')
+
+pd_fragment_ratio_var <- setDT(pd_fragment_ratio_var_test_global) %>%
+  foverlaps(
+      df_fragment_ratio_vartest_regions %>%
+        select(chr, start, end, region_pval = z_p) %>%
+        setDT(key = c('chr', 'start', 'end')),
+      by.x = c('seqnames', 'start', 'end'),
+      by.y = c('chr', 'start', 'end')
+    ) %>%
+  group_by(seqnames, start, end) %>%
+  mutate(
+    var_ratio = log10(cancer / normal),
+    region_var_ratio = median(var_ratio)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    signif = case_when(
+      (region_pval < 0.05) & (region_var_ratio > 0) ~ 'Cancer',
+      (region_pval < 0.05) & (region_var_ratio < 0) ~ 'Normal',
+      TRUE ~ 'Neither'
+    ) %>%
+      factor(levels = c('Cancer', 'Normal', 'Cancer point', 'Normal point', 'Neither'))
+  )
+
+pd_fragment_ratio_var_regions <- pd_fragment_ratio_var %>%
+  group_by(seqnames, start, end) %>%
+  summarise(
+    global_start = min(global_start),
+    global_end = global_start + unique(end - start),
+    var_ratio = median(var_ratio),
+    region_pval = unique(region_pval),
+    signif = case_when(
+      var_ratio > 0 & region_pval < 0.05 ~ 'Cancer',
+      var_ratio < 0 & region_pval < 0.05 ~ 'Normal',
+      TRUE ~ 'Neither'
+    ) %>%
+      factor(levels = c('Cancer', 'Normal', 'Neither'))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(global_end))
+
+p_fragment_var_tests <- pd_fragment_ratio_var_regions %>%
+  ggplot() +
+  geom_vline(
+    aes(
+      xintercept = arm_start
+    ),
+    data = pd_fragment_arms,
+    size = 0.5,
+    color = 'Grey90'
+  ) +
+  geom_text(
+    aes(
+      x = chr_start,
+      y = 1,
+      label = seqnames,
+      group = 0
+    ),
+    data = pd_fragment_arms %>%
+      mutate(seqnames = gsub('chr', '', seqnames)) %>%
+      group_by(seqnames) %>%
+      summarise(chr_start = min(arm_start)) %>%
+      ungroup(),
+    hjust = 0,
+    fontface = 'bold'
+  ) +
+  geom_text(
+    aes(
+      x = arm_start,
+      y = 0.9,
+      label = arm_letter,
+      group = 0
+    ),
+    data = pd_fragment_arms %>% mutate(arm_letter = gsub('\\d', '', arm)),
+    hjust = 0
+  ) +
+  geom_point(
+    aes(
+      x = global_start,
+      y = var_ratio,
+      color = signif
+    ),
+    data = pd_fragment_ratio_var,
+    alpha = 0.5,
+    shape = 16 
+  ) +
+  geom_segment(
+    aes(
+      x = global_start,
+      xend = global_end,
+      y = var_ratio,
+      yend = var_ratio,
+      color = signif
+    ),
+    size = 3
+  ) +
+  scale_color_manual(
+    values = c(
+      brewer.pal(3, 'Set1')[1],
+      brewer.pal(3, 'Set1')[2],
+      'Grey80'
+    ),
+    na.value = 'Grey80'
+  ) +
+  geom_hline(color = 'black', yintercept = 0) +
+  labs(
+    x = 'Genomic locus',
+    y = 'Log2 variance ratio',
+    color = 'More variable group\n(Ansari-Bradley test p<0.05)'
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+p_var_test_windows_beeswarm <- pd_fragment_ratio_var_test_global %>%
+  mutate(
+    var_ratio = log10(cancer / normal),
+  ) %>%
+  ggplot(aes(
+    y = var_ratio
+  )) +
+  geom_boxplot(color = 'black', fill = NA, outlier.shape=NA, width = 0.25) +
+  geom_beeswarm(
+    aes(
+      x = 0,
+      color = more_variable_group,
+    ), 
+    cex = 2,
+    size = 0.5
+  ) +
+  scale_color_brewer(palette = 'Set1') +
+  geom_hline(color = 'black', yintercept = 0) +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  ggtitle('All windows')
+
+pg_fragment_ratio <- plot_grid(
+  p_fragment_ratio,
+  #p_var_test_bar + theme(legend.position = 'none'),
+  p_fragment_var_tests + theme(legend.position = 'none'),
+  NULL,
+  p_var_test_windows_beeswarm +
+    theme(legend.position = 'none'),
+  ncol = 2,
+  byrow = F,
+  align = 'vh',
+  axis = 'lrtb',
+  rel_heights = c(2, 1),
+  rel_widths = c(4, 1),
+  labels = c('A', '', 'B', 'C')
+) %>%
+  plot_grid(
+    get_legend(p_fragment_var_tests + theme(legend.position = 'bottom')),
+    ncol = 1,
+    rel_heights = c(20, 1)
+  )
+
+pg_fragment_ratio
+
+val_n_fl_variable_regions <- pd_fragment_ratio_var_regions %>%
+  filter(signif == 'Cancer') %>%
+  nrow()
+val_n_fl_variable_regions_normal <- pd_fragment_ratio_var_regions %>%
+  filter(signif == 'Normal') %>%
+  nrow()
+val_total_significant_variable_length <- pd_fragment_ratio_var_regions %>%
+  filter(signif == 'Cancer') %>%
+  mutate(width = end - start) %>%
+  .$width %>%
+  sum()
+val_total_significant_variable_length_gb <- value_to_string(val_total_significant_variable_length / 1e9)
+val_total_autosome_length = df_chromosome_lengths %>%
+  filter(Chromosome %in% as.character(1:22)) %>%
+  .$Total_Length %>%
+  sum()
+val_fl_signif_variable_percent <- value_to_percent(val_total_significant_variable_length / val_total_autosome_length)
+```
+
+
+# Supplemental Figure 5
+
+```{r fl_nmf, fig.width = 10, fig.height = 8}
+# ---------- #
+# NMF Method #
+# ---------- #
+
+df_all_insertsize_extended <- right_join(
+    df_insertsize,
+    crossing(
+      library = df_insertsize$library,
+      insert_size = 30:250
+    )
+  ) %>%
+  replace_na(list(All_Reads.fr_count = 0)) %>%
+  arrange(library, insert_size) %>%
+  select(-file)
+
+m_all_insertsize_extended <- df_all_insertsize_extended %>%
+  group_by(library) %>%
+  mutate(proportion = All_Reads.fr_count / sum(All_Reads.fr_count)) %>%
+  ungroup() %>%
+  group_by(insert_size) %>%
+  filter(any(proportion) > 0) %>%
+  ungroup() %>%
+  select(library, insert_size, proportion) %>%
+  spread(insert_size, proportion) %>%
+  column_to_rownames('library') %>%
+  as.matrix() %>%
+  t()
+
+nmf_insertsize <- nmf(
+  m_all_insertsize_extended,
+  rank = 2
+)
+
+plotdata_nmf_basis <- basis(nmf_insertsize) %>%
+  as_tibble(rownames = 'fragment_length') %>%
+  gather(component, basis, -fragment_length) %>%
+  mutate(fragment_length = as.integer(fragment_length)) %>%
+  group_by(component) %>%
+  mutate(
+    proportion = basis / sum(basis),
+    component_mean = sum(fragment_length * proportion)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    signature = if_else(component_mean == min(component_mean), 'cancer', 'normal')
+  ) %>%
+  ungroup() %>%
+  select(-component_mean)
+
+plotdata_nmf_weights <- coef(nmf_insertsize) %>%
+  t() %>%
+  as_tibble(rownames = 'library') %>%
+  gather(component, value, -library) %>%
+  left_join(plotdata_nmf_basis %>% distinct(component, signature)) %>%
+  select(-component) %>%
+  spread(signature, value) %>%
+  left_join(df_samples) %>%
+  mutate(
+    sample_type = case_when(
+      startsWith(library, 'AIX') | startsWith(library, 'TGL49') ~ 'Normal Control',
+      startsWith(library, 'TGL') & timepoint == 'SB' ~ 'Baseline',
+      startsWith(library, 'TGL') & timepoint == 'C3B' ~ 'Cycle 3',
+      TRUE ~ 'Later Cycle'
+    ) %>% factor(levels = c('Baseline', 'Cycle 3', 'Later Cycle', 'Normal Control'))
+  ) %>%
+  select(library, sample_type, cancer, normal) %>%
+  arrange(sample_type, cancer) %>%
+  mutate(
+    library = factor(
+      library,
+      levels = unique(library)
+    )
+  ) %>%
+  gather(component, weight, -library, -sample_type) %>%
+  group_by(library) %>%
+  mutate(weight = weight / sum(weight)) %>%
+  ungroup()
+
+p_heatmap_nmf_weights <- plotdata_nmf_weights %>%
+  ggplot(aes(
+    x = component,
+    y = library,
+    fill = weight
+  )) +
+  geom_tile() +
+  scale_fill_viridis() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+p_colorbar_nmf_weights <- plotdata_nmf_weights %>%
+  ggplot(aes(
+    x = 0,
+    y = library,
+    fill = sample_type
+  )) +
+  geom_tile() +
+  scale_fill_brewer(palette = 'Set1') +
+  theme_void()
+
+p_nmf_weights_beeswarm <- plotdata_nmf_weights %>%
+  filter(component == 'cancer') %>%
+  ggplot(aes(
+    x = sample_type,
+    y = weight
+  )) +
+  geom_beeswarm(color = 'black', size = 0.5) +
+  labs(
+    x = 'Sample Type',
+    y = 'NMF Cancer\nComponent Weight'
+  )
+
+plotdata_nmf_immunescore <- plotdata_nmf_weights %>%
+  inner_join(
+    bind_rows(
+      df_csm,
+      df_csm_normalcontrol
+    ),
+    by = 'library'
+  )
+
+p_nmf_csm_correlation <- plotdata_nmf_immunescore %>%
+  filter(immune_group == 'Non-immune') %>%
+  ggplot(aes(
+    x = weight,
+    y = score,
+    color = component
+  )) +
+  facet_grid(component ~ .) +
+  geom_point() +
+  scale_y_log10() +
+  labs(
+    x = 'NMF component weight',
+    y = 'CSM'
+  )
+
+plotdata_nmf_cancer_likelihood <- plotdata_nmf_basis %>%
+  left_join(
+    plotdata_nmf_basis %>%
+      group_by(component) %>%
+      summarise(mean_fl = sum(fragment_length * proportion)) %>%
+      mutate(component_name = if_else(mean_fl == min(mean_fl), 'Cancer', 'Normal'))
+  ) %>%
+  select(component_name, fragment_length, proportion) %>%
+  spread(component_name, proportion) %>%
+  mutate(cancer_likelihood = Cancer / (Cancer + Normal))
+
+p_nmf_basis <- plotdata_nmf_cancer_likelihood %>%
+  gather(group, value, -fragment_length, -cancer_likelihood) %>%
+  ggplot(aes(
+    x = fragment_length,
+    y = value,
+    color = group,
+    group = group
+  )) +
+  geom_line() +
+  labs(
+    x = 'Fragment Length',
+    y = 'Basis value',
+    color = 'NMF component'
+  )
+
+p_nmf_basis_likelihood <- plotdata_nmf_cancer_likelihood %>%
+  distinct(fragment_length, cancer_likelihood) %>%
+  ggplot(aes(
+    x = fragment_length,
+    y = cancer_likelihood
+  )) +
+  geom_line()
+
+# ---------------------------- #
+# Nucleosome position analysis #
+# ---------------------------- #
+
+plotdata_nucleosomes <- df_nucleosomes %>%
+  gather(chr, reads, -library, -distance) %>%
+  group_by(distance, library) %>%
+  summarise(reads = sum(reads)) %>%
+  ungroup() %>%
+  group_by(library) %>%
+  mutate(
+    fraction_of_reads = reads / sum(reads)
+  ) %>%
+  ungroup() %>%
+  left_join(
+      df_samples
+  ) %>%
+  mutate(
+    cohort = if_else(is.na(cohort), 'Control', cohort)
+  )
+
+plotdata_nucleosome_variance <- plotdata_nucleosomes %>%
+  group_by(distance) %>%
+  summarise(variance = var(fraction_of_reads)) %>%
+  ungroup()
+
+m_nucleosome <- plotdata_nucleosome_variance %>%
+  arrange(-variance) %>%
+  filter(row_number() <= 100) %>%
+  distinct(distance) %>%
+  left_join(plotdata_nucleosomes) %>%
+  select(library, distance, fraction_of_reads) %>%
+  spread(library, fraction_of_reads) %>%
+  column_to_rownames('distance') %>%
+  as.matrix()
+
+result_nmf <- nmf(m_nucleosome, rank = 2)
+
+plotdata_nucleosome_basis <- basis(result_nmf) %>%
+  as_tibble(rownames = 'distance') %>%
+  mutate(
+    distance = as.integer(distance)
+  ) %>%
+  gather(component, value, -distance) %>%
+  group_by(component) %>%
+  mutate(zero_value = value[distance == 0]) %>%
+  ungroup() %>%
+  mutate(signature = if_else(zero_value == max(zero_value), 'NS1 (cancer)', 'NS2 (normal)')) %>%
+  select(-zero_value)
+
+p_nucleosome_basis <- plotdata_nucleosome_basis %>%
+  ggplot(aes(
+    x = distance,
+    y = value,
+    color = signature 
+  )) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = 'Distance to\nNucleosome Peak',
+    y = 'Basis Value',
+    component = 'Signature'
+  )
+
+plotdata_coef <- coef(result_nmf) %>%
+  t() %>%
+  as_tibble(rownames = 'library') %>%
+  gather(component, weight, -library) %>%
+  left_join(plotdata_nucleosome_basis %>% distinct(component, signature)) %>%
+  left_join(
+    bind_rows(
+      df_samples,
+    )
+  ) %>%
+  mutate(cohort = if_else(is.na(cohort), 'Control', cohort)) %>%
+  arrange(cohort) %>%
+  mutate(
+    library = factor(library, levels = unique(library))
+  ) %>%
+  group_by(library) %>%
+  mutate(weight = weight / sum(weight)) %>%
+  ungroup()
+
+plotdata_coef_baseline <- plotdata_coef %>%
+  filter(timepoint == 'SB' | cohort == 'Control')
+
+p_heatmap_nucleosome_coef <- plotdata_coef_baseline %>%
+  ggplot(aes(
+    x = signature,
+    y = library,
+    fill = weight
+  )) +
+  geom_tile() +
+  scale_fill_viridis() +
+  theme(
+    axis.text.y = element_blank()
+  ) +
+  labs(
+    x = 'Nucleosome Signature',
+    y = 'Sample',
+    fill = 'Weight'
+  )
+
+p_colorbar_nucleosome_coef_cohort <- plotdata_coef_baseline %>%
+  ggplot(aes(
+    x = 0,
+    y = library,
+    fill = cohort
+  )) +
+  geom_tile() +
+  scale_fill_manual(values = rainbow(6)) +
+  theme_void()
+
+plotdata_nucleosome_score <- plotdata_coef %>%
+  filter(signature == 'NS1 (cancer)') %>%
+  group_by(cohort, patient, timepoint, library) %>%
+  summarise(nucleosome_score = sum(weight)) %>%
+  ungroup()
+
+p_nucleosome_correlation <- plotdata_nucleosome_score %>%
+  mutate(gsub('_CM', '', library)) %>%
+  left_join(
+    df_csm %>% select(library, immune_group, score),
+    by = c('library')
+  ) %>%
+  filter(
+    immune_group == 'Non-immune'
+  ) %>%
+  ggplot(aes(
+    x = score,
+    y = nucleosome_score
+  )) +
+  geom_point() +
+  scale_x_log10() +
+  labs(
+    x = 'CSM',
+    y = 'NS2 (Cancer Signature)'
+  ) 
+
+plotdata_delta_nucleosome_score <- plotdata_nucleosome_score %>%
+  filter(
+    cohort != 'Control',
+    timepoint %in% c('SB', 'C3B')
+  ) %>%
+  select(-library) %>%
+  spread(timepoint, nucleosome_score) %>%
+  mutate(diff_nucleosome = C3B - SB) %>%
+  mutate(diff_group_nucleosome = if_else(diff_nucleosome > 0, 'Increase', 'Decrease') %>% factor(levels = c('Increase', 'Decrease'))) %>%
+  filter(!is.na(diff_nucleosome))
+
+plotdata_delta_nucleosome_csm <- plotdata_delta_nucleosome_score %>%
+  left_join(plotdata_delta_csm, by = c('cohort', 'patient'))
+
+
+p_beeswarm_nucleosome <- plotdata_nucleosome_score %>%
+  mutate(
+    timepoint_group = case_when(
+      cohort == 'Control' ~ 'Normal Control',
+      timepoint == 'SB' ~ 'Baseline',
+      timepoint == 'C3B' ~ 'Cycle 3',
+      TRUE ~ 'Later Cycle'
+    ) %>% factor(levels = c('Baseline', 'Cycle 3', 'Later Cycle', 'Normal Control'))
+  ) %>%
+  ggplot(aes(
+    x = timepoint_group,
+    y = nucleosome_score
+  )) +
+  geom_beeswarm(color = 'black', size = 0.5) +
+  labs(
+    x = 'Sample Type',
+    y = 'Nucleosome distance NMF\nCancer component weight'
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# --------------------- #
+# Fragment Length Score #
+# --------------------- #
+
+plotdata_fls_spider <- df_fls %>%
+  left_join(df_samples) %>%
+  left_join(
+    df_clinical %>%
+      select(patient, best_response, best_response_cycle)
+  ) %>%
+  mutate(
+    timepoint_numeric = case_when(
+      timepoint == 'SB' ~ -100,
+      timepoint == 'EOTB' ~ -1,
+      TRUE ~ gsub('C', '', timepoint) %>% gsub('B', '', .) %>% as.numeric
+    ),
+    best_response_cycle_numeric = case_when(
+      best_response %in% c('PD', 'NE') ~ -100,
+      TRUE ~ as.numeric(gsub('(\\d+).*', '\\1', best_response_cycle))
+    ),
+    diff = abs(timepoint_numeric - best_response_cycle_numeric)
+  ) %>%
+  group_by(patient) %>%
+  mutate(
+    best_response_closest = case_when(
+      best_response %in% c('PD', 'NE') ~ 'None',
+      (best_response_cycle_numeric > max(timepoint_numeric)) & ('EOTB' %in% timepoint) ~ 'EOTB',
+      TRUE ~ as.character(timepoint[diff == min(diff)])
+    ),
+    best_response_closest = case_when(
+      best_response_closest == 'SB' ~ 'None',
+      TRUE ~ best_response_closest
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    is_best_response_cycle = timepoint == best_response_closest
+  )
+
+plot_fls_spider <- plotdata_fls_spider %>%
+  filter(!is.na(timepoint)) %>%
+  filter(timepoint != 'EOTB') %>%
+  ggplot(aes(
+    x = timepoint,
+    y = fragment_score,
+    #color = best_response,
+    group = patient
+  )) +
+  geom_line(size = 0.3) +
+  #geom_point(
+  #  aes(
+  #    x = timepoint,
+  #    y = fragment_score,
+  #    color = best_response
+  #  ),
+  #  data = plotdata_fls_spider %>%
+  #    filter(is_best_response_cycle),
+  #  size = 2,
+  #  shape = 8
+  #) +
+  geom_point(size = 0.8) +
+  scale_size_manual(values = c(FALSE, TRUE), limits = c(FALSE, TRUE)) +
+  facet_wrap(~ cohort) +
+  scale_color_manual(
+    values = c('#DDDDDD', viridis::inferno(5))
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5)
+  ) +
+  labs(
+    x = 'Timepoint',
+    y = 'cfMeDIP-seq Score'
+  )
+
+plotdata_summary_correl_fls_csm <- df_fls %>%
+  left_join(df_csm) %>%
+  filter(immune_group == 'Non-immune') %>%
+  summarise(
+    r = cor(score, fragment_score, method='spearman'),
+    p = cor.test(score, fragment_score, method='spearman')$p.value
+  )
+
+val_cor_fls_csm_r <- value_to_string(plotdata_summary_correl_fls_csm$r)
+val_cor_fls_csm_p <- pval_to_string(plotdata_summary_correl_fls_csm$p)
+
+p_correl_fls_csm <- df_fls %>%
+  left_join(df_csm) %>%
+  filter(immune_group == 'Non-immune') %>%
+  ggplot(aes(
+    x = score,
+    y = fragment_score
+  )) +
+  geom_point() +
+  scale_x_log10() +
+  labs(
+    x = 'CSM',
+    y = 'FLS'
+  ) +
+  geom_smooth(method = 'lm') +
+  annotate(
+    geom = 'text',
+    x = 0.01,
+    y = 1,
+    label = sprintf('r = %s', val_cor_fls_csm_r),
+    hjust = 0
+  )
+
+plot_grid(
+  get_legend(p_nmf_basis + theme(legend.position = 'top')),
+  plot_grid(
+    p_nmf_basis + theme(legend.position = 'none'),
+    p_nmf_weights_beeswarm,
+    p_nucleosome_basis + theme(legend.position = 'none'),
+    p_beeswarm_nucleosome,
+    labels = c('A', '', 'B')
+  ),
+  ncol = 1,
+  rel_heights = c(1, 20)
+)
+```
+
+
+# Supplemental Figure 6
+
+```{r csm_single_timepoint, fig.width = 7.5, fig.height = 7.5}
+p_nonimmune_median_sb_os <- df_csm %>%
+    filter(!is.na(natera)) %>%
+    left_join(df_clinical) %>%
+    filter(immune_group == 'Non-immune', timepoint == 'SB') %>%
+    mutate(
+      change = if_else(score > median(score), 'Above median', 'Below median')
+    ) %>%
+    select(
+      patient,
+      change,
+      event = death,
+      time = os_months,
+      cohort = cohort_label
+    ) %>%
+    get_survplot(
+      ahr_coef_name = 'changeBelow median',
+      legend='none', 
+      title = 'OS, baseline', 
+      getfit = T
+    )
+
+p_nonimmune_median_c3b_os <- df_csm %>%
+    filter(!is.na(natera)) %>%
+    left_join(df_clinical) %>%
+    filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+    mutate(
+      change = if_else(score > median(score), 'Above median', 'Below median')
+    ) %>%
+    select(
+      patient,
+      change,
+      event = death,
+      time = os_since_C3,
+      cohort = cohort_label
+    ) %>%
+    get_survplot(
+      ahr_coef_name = 'changeBelow median',
+      legend='none',
+      title = 'OS, cycle 3',
+      getfit = T
+    )
+
+p_nonimmune_median_sb_pfs <- df_csm %>%
+    filter(!is.na(natera)) %>%
+    left_join(df_clinical) %>%
+    filter(immune_group == 'Non-immune', timepoint == 'SB') %>%
+    mutate(
+      change = if_else(score > median(score), 'Above median', 'Below median')
+    ) %>%
+    select(
+      patient,
+      change,
+      event = pfs_event,
+      time = pfs_months,
+      cohort = cohort_label
+    ) %>%
+    get_survplot(
+      ahr_coef_name = 'changeBelow median',
+      legend='none',
+      title = 'PFS, baseline',
+      getfit = T
+    )
+
+p_nonimmune_median_c3b_pfs <- df_csm %>%
+    filter(!is.na(natera)) %>%
+    left_join(df_clinical) %>%
+    filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+    mutate(
+      change = if_else(score > median(score), 'Above median', 'Below median')
+    ) %>%
+    select(
+      patient,
+      change,
+      event = pfs_event,
+      time = pfs_since_C3,
+      cohort = cohort_label
+    ) %>%
+    get_survplot(
+      ahr_coef_name = 'changeBelow median',
+      legend='none',
+      title = 'PFS, cycle 3',
+      getfit = T
+    )
+
+plot_grid(
+  p_nonimmune_median_sb_os$survplot,
+  p_nonimmune_median_c3b_os$survplot,
+  p_nonimmune_median_sb_pfs$survplot,
+  p_nonimmune_median_c3b_pfs$survplot
+) %>%
+  plot_grid(
+    df_csm %>%
+      filter(!is.na(natera)) %>%
+      left_join(df_clinical) %>%
+      filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+      mutate(
+        change = if_else(score > median(score), 'Above median', 'Below median')
+      ) %>%
+      select(
+        patient,
+        change,
+        event = pfs_event,
+        time = pfs_since_C3,
+        cohort = cohort_label
+      ) %>%
+      get_survplot(ahr_coef_name = 'changeBelow median', legend='top', cowplot=F) %>%
+      .$plot %>% get_legend,
+    .,
+    rel_heights = c(1,20),
+    ncol = 1
+  )
+
+```
+
+
+# Supplemental Figure 7
+
+```{r singletimepoint_cycle3_cox_mva, fig.width = 10, fig.height = 14}
+plotdata_c3b_mva <- df_csm %>%
+  filter(!is.na(natera)) %>%
+  left_join(df_clinical) %>%
+  filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+  mutate(
+    CSM = if_else(score > median(score), 'Above median', 'Below median'),
+    CMC = if_else(score > median(natera), 'Above median', 'Below median'),
+    cohort = cohort_label
+  ) %>%
+  left_join(df_biomarkers %>% mutate(pdl1_fraction = pdl1_percent / 100) %>% select(-pdl1_percent)) %>%
+  dplyr::rename(
+    `PD-L1 fraction` = pdl1_fraction,
+    `log TMB` = log_tmb
+  )
+
+plotdata_sb_mva <- df_csm %>%
+  filter(!is.na(natera)) %>%
+  left_join(df_clinical) %>%
+  filter(immune_group == 'Non-immune', timepoint == 'SB') %>%
+  mutate(
+    CSM = if_else(score > median(score), 'Above median', 'Below median'),
+    CMC = if_else(score > median(natera), 'Above median', 'Below median'),
+    cohort = cohort_label
+  ) %>%
+  left_join(df_biomarkers %>% mutate(pdl1_fraction = pdl1_percent / 100) %>% select(-pdl1_percent)) %>%
+  dplyr::rename(
+    `PD-L1 fraction` = pdl1_fraction,
+    `log TMB` = log_tmb
+  )
+
+cox_sb_os <- coxph(
+    Surv(os_months, death) ~ CSM + cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_sb_mva
+  )
+
+cox_sb_pfs <- coxph(
+    Surv(pfs_months, death) ~ CSM + cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_sb_mva
+  )
+
+cox_c3b_os <- coxph(
+    Surv(os_since_C3, death) ~ CSM + cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_c3b_mva
+  )
+
+cox_c3b_pfs <- coxph(
+    Surv(pfs_since_C3, death) ~ CSM + cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_c3b_mva
+  )
+
+plot_grid(
+  cox_sb_os %>% forest_model() + ggtitle('Baseline - OS'),
+  cox_sb_pfs %>% forest_model() + ggtitle('Baseline - PFS'),
+  cox_c3b_os %>% forest_model() + ggtitle('Cycle 3 - OS'),
+  cox_c3b_pfs %>% forest_model() + ggtitle('Cycle 3 - PFS'),
+  ncol = 1
+)
+```
+
+
+# Supplemental Figure 8
+
+```{r cmc_singletimepoint, fig.width = 7.5, fig.height = 7.5}
+p_cmc_sb_pfs <- df_csm %>%
+  filter(immune_group == 'Non-immune', timepoint == 'SB') %>%
+  mutate(
+    change = factor(if_else(natera < median(natera, na.rm = T), 'Below Median', 'Above Median'), levels = c('Above Median', 'Below Median'))
+  ) %>%
+  left_join(df_clinical) %>%
+  select(
+      patient,
+      change,
+      event = pfs_event,
+      time = pfs_months,
+      cohort = cohort_label
+    ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow Median', legend='none', title = 'PFS, baseline')
+
+p_cmc_sb_os <- df_csm %>%
+  filter(immune_group == 'Non-immune', timepoint == 'SB') %>%
+  mutate(
+    change = factor(if_else(natera < median(natera, na.rm = T), 'Below Median', 'Above Median'), levels = c('Above Median', 'Below Median'))
+  ) %>%
+  left_join(df_clinical) %>%
+  select(
+      patient,
+      change,
+      event = death,
+      time = os_months,
+      cohort = cohort_label
+    ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow Median', legend='none', title = 'OS, baseline')
+
+p_cmc_c3b_pfs <- df_csm %>%
+  filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+  mutate(
+    change = factor(if_else(natera < median(natera, na.rm = T), 'Below Median', 'Above Median'), levels = c('Above Median', 'Below Median'))
+  ) %>%
+  left_join(df_clinical) %>%
+  select(
+      patient,
+      change,
+      event = pfs_event,
+      time = pfs_since_C3,
+      cohort = cohort_label
+    ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow Median', legend='none', title = 'PFS, cycle 3')
+
+p_cmc_c3b_os <- df_csm %>%
+  filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+  mutate(
+    change = factor(if_else(natera < median(natera, na.rm = T), 'Below Median', 'Above Median'), levels = c('Above Median', 'Below Median'))
+  ) %>%
+  left_join(df_clinical) %>%
+  select(
+      patient,
+      change,
+      event = death,
+      time = os_since_C3,
+      cohort = cohort_label
+    ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow Median', legend='none', title = 'OS, cycle 3')
+
+plot_grid(
+  p_cmc_sb_os,
+  p_cmc_c3b_os,
+  p_cmc_sb_pfs,
+  p_cmc_c3b_pfs
+) %>%
+  plot_grid(
+    df_csm %>%
+      filter(!is.na(natera)) %>%
+      left_join(df_clinical) %>%
+      filter(immune_group == 'Non-immune', timepoint == 'C3B') %>%
+      mutate(
+        change = if_else(score > median(score), 'Above median', 'Below median')
+      ) %>%
+      select(
+        patient,
+        change,
+        event = pfs_event,
+        time = pfs_since_C3,
+        cohort = cohort_label
+      ) %>%
+      get_survplot(ahr_coef_name = 'changeBelow median', legend='top', cowplot=F) %>%
+      .$plot %>% get_legend,
+    .,
+    rel_heights = c(1,20),
+    ncol = 1
+  )
+```
+
+
+# Supplemental Figure 9
+
+```{r cox_cmc_singletimepoint, fig.width = 10, fig.height = 14}
+cox_c3b_os_natera <- coxph(
+    Surv(os_since_C3, death) ~ CMC + Cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_c3b_mva %>% dplyr::rename(Cohort = cohort_label)
+  )
+
+cox_c3b_pfs_natera <- coxph(
+    Surv(pfs_since_C3, death) ~ CMC + Cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_c3b_mva %>% dplyr::rename(Cohort = cohort_label)
+  )
+
+cox_sb_os_natera <- coxph(
+    Surv(os_months, death) ~ CMC + Cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_sb_mva %>% dplyr::rename(Cohort = cohort_label)
+  )
+
+cox_sb_pfs_natera <- coxph(
+    Surv(pfs_months, death) ~ CMC + Cohort + `PD-L1 fraction` + `log TMB`,
+    data = plotdata_sb_mva %>% dplyr::rename(Cohort = cohort_label)
+  )
+
+
+plot_grid(
+  cox_sb_os_natera %>% forest_model(recalculate_width = 10) + ggtitle('Baseline - OS'),
+  cox_sb_pfs_natera %>% forest_model(recalculate_width = 10) + ggtitle('Baseline - PFS'),
+  cox_c3b_os_natera %>% forest_model(recalculate_width = 10) + ggtitle('Cycle 3 - OS'),
+  cox_c3b_pfs_natera %>% forest_model(recalculate_width = 10) + ggtitle('Cycle 3 - PFS'),
+  ncol = 1
+)
+```
+
+
+# Supplemental Figure 10
+
+```{r multivariate_survival_supplemental, fig.width = 10, fig.height = 8}
+cox_pfs_cmc <- coxph(
+  Surv(pfs_since_C3, pfs_event) ~ `delta CMC` + `Study Cohort` + `PD-L1 fraction` + `log(TMB)`,
+  data = plotdata_mva_cox
+)
+
+cox_os_cmc <- coxph(
+  Surv(os_since_C3, death) ~ `delta CMC` + `Study Cohort` + `PD-L1 fraction` + `log(TMB)`,
+  data = plotdata_mva_cox
+)
+
+plot_grid(
+  cox_pfs_cmc %>% forestmodel::forest_model(recalculate_width = 10) + ggtitle('CMC - PFS'),
+  cox_os_cmc %>% forestmodel::forest_model(recalculate_width = 10) + ggtitle('CMC - OS'),
+  ncol = 1
+)
+```
+
+
+# Supplemental Figure 11
+
+```{r both_increase_vs_all, fig.width=8, fig.height = 5}
+plotdata_bothincrease <- plotdata_mva_forest %>%
+  mutate(
+    both_increase = if_else(`CSM change` == 'Increase' & `CMC change` == 'Increase', 'Both increase', 'Other') %>% factor(levels = c('Both increase', 'Other'))
+  )
+
+cox_bothincrease_os <- coxph(
+  Surv(os_since_C3, death) ~ both_increase + cohort,
+  data = plotdata_bothincrease
+)
+
+cox_bothincrease_pfs <- coxph(
+  Surv(pfs_since_C3, pfs_event) ~ both_increase + cohort,
+  data = plotdata_bothincrease
+)
+
+plot_km_bothincrease_pfs <- plotdata_cfmedip_response %>%
+  mutate(
+    change = if_else(change == 'Increase' & change_group_natera == 'Increase', 'CSM Increase and CMC Increase', 'CSM Decrease or CMC Decrease') %>%
+      factor(levels = c('CSM Increase and CMC Increase', 'CSM Decrease or CMC Decrease'))
+  ) %>%
+  select(
+    patient,
+    change,
+    time = pfs_since_C3,
+    event = pfs_event,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  title = 'Combined - PFS', legend = 'none', ahrstring = T, ahr_coef_name = 'changeCSM Decrease or CMC Decrease', cowplot=T
+)
+
+plot_km_bothincrease_os <- plotdata_cfmedip_response %>%
+  mutate(
+    change = if_else(change == 'Increase' & change_group_natera == 'Increase', 'CSM Increase and CMC Increase', 'CSM Decrease or CMC Decrease') %>%
+      factor(levels = c('CSM Increase and CMC Increase', 'CSM Decrease or CMC Decrease'))
+  ) %>%
+  select(
+    patient,
+    change,
+    time = os_since_C3,
+    event = death,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  title = 'Combined - OS', legend = 'none', ahrstring = T, ahr_coef_name = 'changeCSM Decrease or CMC Decrease', cowplot=T
+)
+
+plot_km_bothincrease_legend <- plotdata_cfmedip_response %>%
+  mutate(
+    change = if_else(change == 'Increase' & change_group_natera == 'Increase', 'CSM Increase and CMC Increase', 'CSM Decrease or CMC Decrease') %>%
+      factor(levels = c('CSM Increase and CMC Increase', 'CSM Decrease or CMC Decrease'))
+  ) %>%
+  select(
+    patient,
+    change,
+    time = os_since_C3,
+    event = death,
+    cohort = cohort
+  ) %>%
+get_survplot(
+  title = 'Combined - OS', legend = 'right', ahrstring=F, cowplot = F
+) %>%
+  .$plot %>%
+  get_legend()
+
+plot_grid(
+  plot_km_bothincrease_pfs,
+  plot_km_bothincrease_os,
+  nrow = 1,
+  rel_widths = c(3,3)
+) %>%
+  plot_grid(
+    plot_km_bothincrease_legend,
+    .,
+    ncol = 1,
+    rel_heights = c(1,4)
+  )
+```
+
+
+# Supplemental Figure 12
+
+```{r csm_fls_correlation, fig.width = 6, fig.height = 5}
+df_fls %>%
+  left_join(df_csm) %>%
+  ggplot(aes(
+    x = score,
+    y = fragment_score
+  )) +
+  geom_point() +
+  scale_x_continuous(
+    trans = scales::pseudo_log_trans(sigma = 0.001),
+    breaks = c(10^(-2:5)),
+    labels = c(10^(-2:5)),
+    name = 'Cancer-specific methylation (CSM) score'
+  ) +
+  geom_smooth(method = 'lm') +
+  annotate(
+    'text',
+    x = 0.001,
+    y = 1,
+    label = sprintf('Spearman rho = %s\n%s', val_cor_fls_csm_r, val_cor_fls_csm_p),
+    hjust = 0
+  ) +
+  labs(
+    y = 'Fragment length score (FLS)'
+  )
+```
+
+
+# Supplemental Figure 13
+
+```{r fls_survival_singletimepoint, fig.width = 8, fig.height = 8}
+p_survplot_fls_sb_os <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'SB') %>%
+  mutate(group = if_else(fragment_score > median(fragment_score), 'Above median', 'Below median') %>% factor(levels = c('Above median', 'Below median'))) %>%
+  left_join(df_clinical) %>%
+  select(
+    patient,
+    cohort,
+    change = group,
+    time = os_months,
+    event = death
+  ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow median', legend = 'none', title = 'Baseline FLS - OS')
+
+p_survplot_fls_c3b_os <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'C3B') %>%
+  mutate(group = if_else(fragment_score > median(fragment_score), 'Above median', 'Below median') %>% factor(levels = c('Above median', 'Below median'))) %>%
+  left_join(df_clinical) %>%
+  select(
+    patient,
+    cohort,
+    change = group,
+    time = os_since_C3,
+    event = death
+  ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow median', legend = 'none', title = 'Cycle 3 FLS - OS')
+
+p_survplot_fls_sb_pfs <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'SB') %>%
+  mutate(group = if_else(fragment_score > median(fragment_score), 'Above median', 'Below median') %>% factor(levels = c('Above median', 'Below median'))) %>%
+  left_join(df_clinical) %>%
+  select(
+    patient,
+    cohort,
+    change = group,
+    time = pfs_months,
+    event = pfs_event
+  ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow median', legend = 'none', title = 'Baseline FLS - PFS')
+
+p_survplot_fls_c3b_pfs <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'C3B') %>%
+  mutate(group = if_else(fragment_score > median(fragment_score), 'Above median', 'Below median') %>% factor(levels = c('Above median', 'Below median'))) %>%
+  left_join(df_clinical) %>%
+  select(
+    patient,
+    cohort,
+    change = group,
+    time = pfs_since_C3,
+    event = pfs_event
+  ) %>%
+  get_survplot(ahr_coef_name = 'changeBelow median', legend = 'none', title = 'Cycle 3 FLS - PFS')
+
+p_survplot_fls_legend <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'C3B') %>%
+  mutate(group = if_else(fragment_score > median(fragment_score), 'Above median', 'Below median') %>% factor(levels = c('Above median', 'Below median'))) %>%
+  left_join(df_clinical) %>%
+  select(
+    patient,
+    cohort,
+    change = group,
+    time = pfs_since_C3,
+    event = pfs_event
+  ) %>%
+  get_survplot(
+    ahr_coef_name = 'changeBelow median',
+    legend = 'top',
+    cowplot=F,
+    legend_title='Fragment length score (FLS)'
+  ) %>%
+  get_legend()
+
+plot_grid(
+  p_survplot_fls_legend,
+  plot_grid(
+    p_survplot_fls_sb_os,
+    p_survplot_fls_c3b_os,
+    p_survplot_fls_sb_pfs,
+    p_survplot_fls_c3b_pfs
+  ),
+  ncol = 1,
+  rel_heights = c(1,10)
+)
+```
+
+
+# Supplemental Figure 14
+
+```{r delta_fls_mva, fig.height = 8, fig.width = 8}
+pd_fls_mva <- plotdata_diff_fragment_score_tcga %>%
+  left_join(df_clinical) %>%
+  left_join(df_biomarkers) %>%
+  dplyr::rename(
+    `delta FLS` = diff_group_fragment_score,
+    `Study Cohort` = cohort,
+    `PD-L1 fraction` = pdl1_percent,
+    `log(TMB)` = log_tmb
+  )
+
+plot_grid(
+  coxph(
+    Surv(os_since_C3, death) ~ `delta FLS` + `Study Cohort` + `PD-L1 fraction` + `log(TMB)`,
+    data = pd_fls_mva
+  ) %>%
+    forest_model() + ggtitle('Fragment Length Score (FLS) MVA - Outcome: Overall survival'),
+  coxph(
+    Surv(pfs_since_C3, pfs_event) ~ `delta FLS` + `Study Cohort` + `PD-L1 fraction` + `log(TMB)`,
+    data = pd_fls_mva
+  ) %>%
+    forest_model() + ggtitle('Fragment Length Score (FLS) MVA - Outcome: Progression-free survival'),
+  ncol = 1
+)
+```
+
+
+# Numeric results
+
+The following table shows every numeric result reported in the manuscript.
+This allows readers to review exactly how every numeric result was calculated.
+
+```{r}
+val_distinct_patients_cfmedip <- length(unique(df_samples$patient))
+val_samples_cfmedip <- length(unique(df_samples$sample))
+val_samples_cfmedip_baseline <- df_samples %>% filter(timepoint == 'SB') %>% distinct(patient) %>% nrow
+val_samples_cfmedip_c3 <- df_samples %>% filter(timepoint == 'C3B') %>% distinct(patient) %>% nrow
+val_n_cohort_a <- df_samples %>% filter(cohort == 'INS-A') %>% distinct(patient) %>% nrow
+val_n_cohort_b <- df_samples %>% filter(cohort == 'INS-B') %>% distinct(patient) %>% nrow
+val_n_cohort_c <- df_samples %>% filter(cohort == 'INS-C') %>% distinct(patient) %>% nrow
+val_n_cohort_d <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% nrow
+val_n_cohort_e <- df_samples %>% filter(cohort == 'INS-E') %>% distinct(patient) %>% nrow
+val_median_fu <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% .$os_months %>% median %>% value_to_string
+val_min_fu <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% .$os_months %>% min %>% value_to_string
+val_max_fu <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% .$os_months %>% max %>% value_to_string
+val_median_fu_alive <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% filter(!death) %>% .$os_months %>% median %>% value_to_string
+val_min_fu_alive <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% filter(!death) %>% .$os_months %>% min %>% value_to_string
+val_max_fu_alive <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% filter(!death) %>% .$os_months %>% max %>% value_to_string
+val_median_pfs <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% .$pfs_months %>% median %>% value_to_string
+val_min_pfs <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% .$pfs_months %>% min %>% value_to_string
+val_max_pfs <- df_samples %>% distinct(patient) %>% left_join(df_clinical) %>% .$pfs_months %>% max %>% value_to_string
+val_csm_cpg_count_nonimmune <- df_posterior %>% distinct(probeID) %>% nrow
+val_median_os_melanoma <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% left_join(df_clinical) %>% .$os_months %>% median %>% value_to_string
+val_min_os_melanoma <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% left_join(df_clinical) %>% .$os_months %>% min %>% value_to_string
+val_max_os_melanoma <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% left_join(df_clinical) %>% .$os_months %>% max %>% value_to_string
+val_median_pfs_melanoma <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% left_join(df_clinical) %>% .$pfs_months %>% median %>% value_to_string
+val_min_pfs_melanoma <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% left_join(df_clinical) %>% .$pfs_months %>% min %>% value_to_string
+val_max_pfs_melanoma <- df_samples %>% filter(cohort == 'INS-D') %>% distinct(patient) %>% left_join(df_clinical) %>% .$pfs_months %>% max %>% value_to_string
+val_n_csm_bins_in_islands <- df_methylation_signature %>% filter(region_cpg_type == 'islands') %>% nrow
+val_percent_csm_bins_in_islands <- value_to_percent(val_n_csm_bins_in_islands / val_csm_cpg_count_nonimmune)
+val_n_csm_bins_in_shores <- df_methylation_signature %>% filter(region_cpg_type == 'shores') %>% nrow
+val_percent_csm_bins_in_shores <- value_to_percent(val_n_csm_bins_in_shores / val_csm_cpg_count_nonimmune)
+
+pd_change_from_baseline_by_best_response <- pd_glmprediction_by_timepoint %>%
+  group_by(patient) %>%
+  filter(is_best_response_cycle | (best_response == 'PD' & as.integer(timepoint) == max(as.integer(timepoint)))) %>%
+  ungroup() %>%
+  distinct(patient, best_response, responder, change_from_baseline) %>%
+  arrange(best_response) %>%
+  mutate(increase = change_from_baseline > 0) %>%
+  filter(!is.na(increase)) %>%
+  mutate(responder = factor(responder))
+
+pd_change_from_baseline_by_best_response_summary <- pd_change_from_baseline_by_best_response %>%
+  group_by(responder) %>%
+  summarise(
+    n_increase = sum(increase),
+    n_decrease = sum(!increase),
+    n = n(),
+    fraction_decrease = n_decrease / n
+  ) %>%
+  ungroup() %>%
+  arrange(responder)
+
+val_n_decrease_nonresponder <- pd_change_from_baseline_by_best_response_summary$n_decrease[1]
+val_n_nonresponder <- pd_change_from_baseline_by_best_response_summary$n[1]
+val_percent_decrease_nonresponder <- pd_change_from_baseline_by_best_response_summary$fraction_decrease[1] %>% value_to_percent
+val_n_decrease_responder <- pd_change_from_baseline_by_best_response_summary$n_decrease[2]
+val_n_responder <- pd_change_from_baseline_by_best_response_summary$n[2]
+val_percent_decrease_responder <- pd_change_from_baseline_by_best_response_summary$fraction_decrease[2] %>% value_to_percent
+val_responder_decrease_fisherp <- with(pd_change_from_baseline_by_best_response, fisher.test(responder, increase))$p.value %>% pval_to_string
+
+val_n_natera_cfmedip_baseline <- df_samples %>% filter(timepoint == 'SB') %>% filter(patient %in% (df_natera_timepoint %>% filter(timepoint == 'SB') %>% .$patient)) %>% nrow()
+val_n_natera_cfmedip_c3b <- df_samples %>% filter(timepoint == 'C3B') %>% filter(patient %in% (df_natera_timepoint %>% filter(timepoint == 'C3B') %>% .$patient)) %>% nrow()
+
+val_n_csm_cmc_both_timepoints <- df_samples %>% group_by(patient) %>% filter('SB' %in% timepoint, 'C3B' %in% timepoint) %>% ungroup() %>% distinct(patient) %>% inner_join(df_natera_timepoint) %>% group_by(patient) %>% filter('SB' %in% timepoint, 'C3B' %in% timepoint) %>% ungroup %>% distinct(patient) %>% nrow()
+
+val_correl_cfmedip_cmc_global_r <- pd_glmprediction_by_timepoint %>%
+  filter(
+    timepoint %in% c('SB', 'C3B'),
+    !is.na(natera),
+    !is.na(prediction)
+  ) %>%
+  with(cor(.$prediction, .$natera, method='spearman')) %>%
+  as.numeric %>%
+  value_to_string()
+
+val_cfmedip_median_decrease_responder <- pd_glmprediction_by_timepoint %>%
+  filter(timepoint == 'C3B', !is.na(relative_change_from_baseline)) %>%
+  filter(responder == 'Responder (PR/CR)') %>%
+  .$relative_change_from_baseline %>% {.* 100} %>% median_range('%')
+
+val_cfmedip_median_rise_nonresponder <- pd_glmprediction_by_timepoint %>%
+  filter(timepoint == 'C3B', !is.na(relative_change_from_baseline)) %>%
+  filter(responder == 'Non-responder (SD/PD)') %>%
+  .$relative_change_from_baseline %>% {.* 100} %>% median_range('%')
+
+val_cfmedip_by_response_wilcox_p <- wilcox.test(
+  relative_change_from_baseline ~ responder,
+  data = pd_glmprediction_by_timepoint %>%
+    filter(timepoint == 'C3B', !is.na(relative_change_from_baseline)),
+  alternative = 'two.sided'
+)$p.value %>% pval_to_string()
+
+val_clearance_threshold_sensitivity <- pd_clearance_roc %>%
+  filter(prediction == v_clearance_optimal_threshold) %>%
+  .$TPR %>%
+  value_to_percent()
+
+val_clearance_threshold_specificity <- pd_clearance_roc %>%
+  filter(prediction == v_clearance_optimal_threshold) %>%
+  {1 - .$FPR} %>%
+  value_to_percent()
+
+val_clearance_optimal_threshold <- value_to_string(v_clearance_optimal_threshold)
+val_clearance_optimal_threshold_F1 <- value_to_string(v_clearance_optimal_threshold_F1)
+
+val_ahr_csm_baseline_pfs <- ratio_to_string(p_nonimmune_median_sb_pfs$cox$aHR)
+val_ahr_csm_baseline_pfs_lci <- ratio_to_string(p_nonimmune_median_sb_pfs$cox$lCI)
+val_ahr_csm_baseline_pfs_uci <- ratio_to_string(p_nonimmune_median_sb_pfs$cox$uCI)
+val_ahr_csm_baseline_pfs_p <- pval_to_string(p_nonimmune_median_sb_pfs$cox$p)
+
+val_ahr_csm_baseline_os <- ratio_to_string(p_nonimmune_median_sb_os$cox$aHR)
+val_ahr_csm_baseline_os_lci <- ratio_to_string(p_nonimmune_median_sb_os$cox$lCI)
+val_ahr_csm_baseline_os_uci <- ratio_to_string(p_nonimmune_median_sb_os$cox$uCI)
+val_ahr_csm_baseline_os_p <- pval_to_string(p_nonimmune_median_sb_os$cox$p)
+
+val_ahr_csm_c3b_pfs <- ratio_to_string(p_nonimmune_median_c3b_pfs$cox$aHR)
+val_ahr_csm_c3b_pfs_lci <- ratio_to_string(p_nonimmune_median_c3b_pfs$cox$lCI)
+val_ahr_csm_c3b_pfs_uci <- ratio_to_string(p_nonimmune_median_c3b_pfs$cox$uCI)
+val_ahr_csm_c3b_pfs_p <- pval_to_string(p_nonimmune_median_c3b_pfs$cox$p)
+
+val_ahr_csm_c3b_os <- ratio_to_string(p_nonimmune_median_c3b_os$cox$aHR)
+val_ahr_csm_c3b_os_lci <- ratio_to_string(p_nonimmune_median_c3b_os$cox$lCI)
+val_ahr_csm_c3b_os_uci <- ratio_to_string(p_nonimmune_median_c3b_os$cox$uCI)
+val_ahr_csm_c3b_os_p <- pval_to_string(p_nonimmune_median_c3b_os$cox$p)
+
+val_deltacsm_pfs_ahr <- ratio_to_string(plot_pfs_cfmedip$cox$aHR)
+val_deltacsm_pfs_ahr_lci <- ratio_to_string(plot_pfs_cfmedip$cox$lCI)
+val_deltacsm_pfs_ahr_uci <- ratio_to_string(plot_pfs_cfmedip$cox$uCI)
+val_deltacsm_pfs_ahr_p <- pval_to_string(plot_pfs_cfmedip$cox$p)
+
+val_deltacsm_os_ahr <- ratio_to_string(plot_os_cfmedip$cox$aHR)
+val_deltacsm_os_ahr_lci <- ratio_to_string(plot_os_cfmedip$cox$lCI)
+val_deltacsm_os_ahr_uci <- ratio_to_string(plot_os_cfmedip$cox$uCI)
+val_deltacsm_os_ahr_p <- pval_to_string(plot_os_cfmedip$cox$p)
+
+val_deltacmc_pfs_ahr <- ratio_to_string(plot_pfs_natera$cox$aHR)
+val_deltacmc_pfs_ahr_lci <- ratio_to_string(plot_pfs_natera$cox$lCI)
+val_deltacmc_pfs_ahr_uci <- ratio_to_string(plot_pfs_natera$cox$uCI)
+val_deltacmc_pfs_ahr_p <- pval_to_string(plot_pfs_natera$cox$p)
+
+val_deltacmc_os_ahr <- ratio_to_string(plot_os_natera$cox$aHR)
+val_deltacmc_os_ahr_lci <- ratio_to_string(plot_os_natera$cox$lCI)
+val_deltacmc_os_ahr_uci <- ratio_to_string(plot_os_natera$cox$uCI)
+val_deltacmc_os_ahr_p <- pval_to_string(plot_os_natera$cox$p)
+
+val_mva_deltacsm_pfs_ahr <- ratio_to_string(exp(cox_pfs_csm$coefficients[1]))
+val_mva_deltacsm_pfs_ahr_lci <- ratio_to_string(exp(confint(cox_pfs_csm)[1, 1]))
+val_mva_deltacsm_pfs_ahr_uci <- ratio_to_string(exp(confint(cox_pfs_csm)[1, 2]))
+val_mva_deltacsm_pfs_ahr_p <- pval_to_string(summary(cox_pfs_csm)$coefficients[1, 5])
+
+val_mva_deltacsm_os_ahr <- ratio_to_string(exp(cox_os_csm$coefficients[1]))
+val_mva_deltacsm_os_ahr_lci <- ratio_to_string(exp(confint(cox_os_csm)[1, 1]))
+val_mva_deltacsm_os_ahr_uci <- ratio_to_string(exp(confint(cox_os_csm)[1, 2]))
+val_mva_deltacsm_os_ahr_p <- pval_to_string(summary(cox_os_csm)$coefficients[1, 5])
+
+val_mva_deltacmc_pfs_ahr <- ratio_to_string(exp(cox_pfs_cmc$coefficients[1]))
+val_mva_deltacmc_pfs_ahr_lci <- ratio_to_string(exp(confint(cox_pfs_cmc)[1, 1]))
+val_mva_deltacmc_pfs_ahr_uci <- ratio_to_string(exp(confint(cox_pfs_cmc)[1, 2]))
+val_mva_deltacmc_pfs_ahr_p <- pval_to_string(summary(cox_pfs_cmc)$coefficients[1, 5])
+
+val_mva_deltacmc_os_ahr <- ratio_to_string(exp(cox_os_cmc$coefficients[1]))
+val_mva_deltacmc_os_ahr_lci <- ratio_to_string(exp(confint(cox_os_cmc)[1, 1]))
+val_mva_deltacmc_os_ahr_uci <- ratio_to_string(exp(confint(cox_os_cmc)[1, 2]))
+val_mva_deltacmc_os_ahr_p <- pval_to_string(summary(cox_os_cmc)$coefficients[1, 5])
+
+val_cmc_csm_concordant <- plotdata_cfmedip_response %>%
+  filter(change == change_group_natera) %>%
+  nrow()
+
+val_cmc_csm_discordant <- plotdata_cfmedip_response %>%
+  filter(change != change_group_natera) %>%
+  nrow()
+
+val_anydecrease_ahr_os <- ratio_to_string(exp(coef(cox_bothincrease_os)[1]))
+val_anydecrease_ahr_lci_os <- ratio_to_string(exp(confint(cox_bothincrease_os)[1, 1]))
+val_anydecrease_ahr_uci_os <- ratio_to_string(exp(confint(cox_bothincrease_os)[1, 2]))
+val_anydecrease_ahr_p_os <- pval_to_string(summary(cox_bothincrease_os)$coefficients[1, 5])
+
+val_anydecrease_ahr_pfs <- ratio_to_string(exp(coef(cox_bothincrease_pfs)[1]))
+val_anydecrease_ahr_lci_pfs <- ratio_to_string(exp(confint(cox_bothincrease_pfs)[1, 1]))
+val_anydecrease_ahr_uci_pfs <- ratio_to_string(exp(confint(cox_bothincrease_pfs)[1, 2]))
+val_anydecrease_ahr_p_pfs <- pval_to_string(summary(cox_bothincrease_pfs)$coefficients[1, 5] < 0.001)
+
+val_uva_fls_pfs_p <- pval_to_string(pfit_fls_survplot_pfs$cox$p)
+val_uva_fls_os_p <- pval_to_string(pfit_fls_survplot_os$cox$p)
+val_uva_fls_pfs_ahr <- ratio_to_string(pfit_fls_survplot_pfs$cox$aHR)
+val_uva_fls_pfs_ahr_lci <- ratio_to_string(pfit_fls_survplot_pfs$cox$lCI)
+val_uva_fls_pfs_ahr_uci <- ratio_to_string(pfit_fls_survplot_pfs$cox$uCI)
+val_uva_fls_os_ahr <- ratio_to_string(pfit_fls_survplot_os$cox$aHR)
+val_uva_fls_os_ahr_lci <- ratio_to_string(pfit_fls_survplot_os$cox$lCI)
+val_uva_fls_os_ahr_uci <- ratio_to_string(pfit_fls_survplot_os$cox$uCI)
+
+val_n_controls <- df_csm_normalcontrol %>% distinct(sample) %>% nrow()
+
+pd_csm_cancervsnormal <- df_csm %>%
+  filter(timepoint == 'SB') %>%
+  select(patient, score) %>%
+  mutate(group = 'Cancer') %>%
+  bind_rows(df_csm_normalcontrol %>% select(patient, score, group))
+
+val_median_csm_cancer_sb <- pd_csm_cancervsnormal %>% filter(group == 'Cancer') %>% .$score %>% median %>% value_to_string()
+val_median_csm_control <- pd_csm_cancervsnormal %>% filter(group == 'Control') %>% .$score %>% median %>% value_to_string()
+val_csm_cancernormal_wilcox_p <- pd_csm_cancervsnormal %>%
+  wilcox.test(score ~ group, data = .) %>%
+  .$p.value %>%
+  pval_to_string()
+
+pd_fls_cancervsnormal <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'SB') %>%
+  select(patient, fragment_score) %>%
+  mutate(group = 'Cancer') %>%
+  bind_rows(df_fls_control %>% select(patient=library, fragment_score) %>% mutate(group = 'Control'))
+
+val_median_fls_cancer_sb <- pd_fls_cancervsnormal %>% filter(group == 'Cancer') %>% .$fragment_score %>% median %>% value_to_string()
+val_median_fls_control <- pd_fls_cancervsnormal %>% filter(group == 'Control') %>% .$fragment_score %>% median %>% value_to_string()
+val_fls_cancernormal_wilcox_p <- pd_fls_cancervsnormal %>%
+  wilcox.test(fragment_score ~ group, data = .) %>%
+  .$p.value %>%
+  pval_to_string()
+
+val_n_controls_awadalla <- df_csm_normalcontrol %>%
+  filter(startsWith(patient, 'AIX')) %>%
+  nrow()
+
+val_fls_percent_variability_temporal <- df_fls %>%
+  left_join(df_samples) %>%
+  filter(timepoint %in% c('SB', 'C3B')) %>%
+  select(cohort, patient, timepoint, fragment_score) %>%
+  spread(timepoint, fragment_score) %>%
+  mutate(percent_change = abs((C3B - SB)/SB)) %>%
+  .$percent_change %>%
+  median(na.rm=T) %>%
+  value_to_percent
+
+val_followup_median_range_clearance_eithermethod_months <- pd_clearance_clinical %>%
+  filter(grepl('Clearance', clearance_group)) %>%
+  .$os_months %>%
+  median_range()
+
+val_fragment_ratio_variability_cancer_vs_normal_percent <- df_fragment_ratio %>%
+  mutate(
+    group = if_else(startsWith(library, 'TGL01'), 'Cancer', 'Control')
+  ) %>%
+  left_join(df_samples) %>%
+  filter(timepoint == 'SB' | group == 'Control') %>%
+  group_by(seqnames, arm, start, end, group) %>%
+  summarise(sd = sd(ratio_centered)) %>%
+  ungroup() %>%
+  spread(group, sd) %>%
+  mutate(percent_diff = (Cancer - Control) / (Control) * 100) %>%
+  .$percent_diff %>%
+  median_range('%')
+
+val_library_read_count <- df_read_counts %>%
+  .$reads %>%
+  {. / 1e6} %>%
+  median_range()
+```
+
+
+```{r}
+env_vars <- ls()
+variables_to_export <- env_vars %>% .[startsWith(., 'val_')]
+
+as_tibble(mget(variables_to_export)) %>%
+  gather(variable, value) %>%
+  mutate(variable = paste(variable, value, sep = ': ')) %>%
+  distinct(variable) %>%
+  pander()
+```
+
+
+# R environment details
+
+For reproducibility purposes, the complete R `sessionInfo` used to generate this report
+is shown below.
+
+```{r}
+print(sessionInfo())
+```
+
+
+```{r, eval=F}
+# This is code that helps during the writing process to
+# identify variables which need to be filled with a value.
+# Feel free to delete this block or mark eval=F if you are
+# running this code on your own system.
+
+vars_used <- stringr::str_match_all(
+  read_lines('~/Documents/Obsidian/Work\ and\ Life/Notes/Paper\ -\ INSPIRE\ cfMeDIP-seq.md'),
+  pattern = '`var:(.*?)`'
+) %>% unlist() %>% unique %>% .[! startsWith(., '`')] %>% .[! startsWith(., 'sf')]
+
+vars_needed <- vars_used %>% .[! (. %in% env_vars)]
+vars_extra <- env_vars %>% .[startsWith(., 'val_')] %>% .[! (. %in% vars_used)]
+
+print(sprintf('%s variables remaining', length(vars_needed)))
+head(vars_needed)
+
+print(sprintf('%s extraneous variables', length(vars_extra)))
+print(vars_extra)
+
+# Make sure no dataframes or lists in the variables
+stopifnot(sum(sapply(mget(variables_to_export), typeof) == 'list') == 0)
+
+write_yaml(mget(variables_to_export), 'variables.yml')
+```
+
+
+
+
+
+
