@@ -80,15 +80,15 @@ attach(readRDS('figure_data.Rds'))
 # CONSORT diagram #
 # --------------- #
 
-img <- readPNG("schematics/Consort-01.png")
-g_consort <- rasterGrob(img, interpolate=TRUE)
+img1 <- readPNG("schematics/Consort-01.png")
+g_consort <- rasterGrob(img1, interpolate=TRUE)
 
 # --------------- #
 # Study flowchart #
 # --------------- #
 
-img <- readPNG("schematics/analysis schema-01.png")
-g_flowchart <- rasterGrob(img, interpolate=TRUE)
+img2 <- readPNG("schematics/analysis schema-01.png")
+g_flowchart <- rasterGrob(img2, interpolate=F)
 
 pd_csm_by_timepoint_group <- df_csm %>%
   bind_rows(df_csm_normalcontrol) %>%
@@ -493,7 +493,7 @@ p_glmprediction_by_timepoint <- pd_glmprediction_by_timepoint %>%
   scale_color_brewer(palette = 'Set1') +
   labs(
     x = 'Timepoint',
-    y = 'Joint ctDNA score\nNormalized change from baseline',
+    y = 'Joint cancer log-odds\nNormalized change from baseline',
     color = 'Cohort',
     shape = 'Best response cycle',
     size = 'Best response cycle'
@@ -561,7 +561,7 @@ p_cfmedip_vs_natera_correlation <- pd_glmprediction_by_timepoint %>%
     data = pd_cfmedip_vs_natera_correlations
   ) +
   labs(
-    x = 'Joint ctDNA score from cfMeDIP-seq',
+    x = 'Joint cancer log-odds from cfMeDIP-seq',
     y = 'Cancer mutation concentration\nfrom bespoke targeted sequencing',
     color = 'cfMeDIP-seq clearance'
   ) +
@@ -601,7 +601,7 @@ p_clearance_f1 <- pd_clearance_roc %>%
     vjust = 0
   ) +
   labs(
-    x = 'Joint ctDNA score',
+    x = 'Joint cancer log-odds',
     y = 'F1 accuracy'
   ) +
   theme(
@@ -1191,7 +1191,7 @@ cox_os_csm <- coxph(
 )
 p_csm_cox_os <- cox_os_csm %>%
   forestmodel::forest_model(recalculate_width = 9) +
-  ggtitle('    Cox model, outcome: PFS')
+  ggtitle('    Cox model, outcome: OS')
 
 # ------------------- #
 # Assemble the figure #
@@ -2533,7 +2533,7 @@ p_fragment_var_tests <- pd_fragment_ratio_var_regions %>%
   geom_hline(color = 'black', yintercept = 0) +
   labs(
     x = 'Genomic locus',
-    y = 'Log2 variance ratio',
+    y = 'Log2 cancer/normal\nvariance ratio',
     color = 'More variable group\n(Ansari-Bradley test p<0.05)'
   ) +
   theme(
@@ -2601,6 +2601,7 @@ val_total_significant_variable_length <- pd_fragment_ratio_var_regions %>%
   mutate(width = end - start) %>%
   .$width %>%
   sum()
+val_total_significant_variable_length_mb <- value_to_string(val_total_significant_variable_length / 1e6)
 val_total_significant_variable_length_gb <- value_to_string(val_total_significant_variable_length / 1e9)
 val_total_autosome_length = df_chromosome_lengths %>%
   filter(Chromosome %in% as.character(1:22)) %>%
@@ -3824,6 +3825,15 @@ val_cmc_csm_discordant <- plotdata_cfmedip_response %>%
   filter(change != change_group_natera) %>%
   nrow()
 
+val_percent_discordant <- value_to_percent(val_cmc_csm_discordant / nrow(plotdata_cfmedip_response))
+
+val_cmc_csm_low_threshold <- 1
+
+val_cmc_csm_discordant_low <- plotdata_cfmedip_response %>%
+  filter(change != change_group_natera) %>%
+  filter(SB < val_cmc_csm_low_threshold | natera_SB < val_cmc_csm_low_threshold) %>%
+  nrow()
+
 val_anydecrease_ahr_os <- ratio_to_string(exp(coef(cox_bothincrease_os)[1]))
 val_anydecrease_ahr_lci_os <- ratio_to_string(exp(confint(cox_bothincrease_os)[1, 1]))
 val_anydecrease_ahr_uci_os <- ratio_to_string(exp(confint(cox_bothincrease_os)[1, 2]))
@@ -3834,7 +3844,7 @@ val_anydecrease_ahr_lci_pfs <- ratio_to_string(exp(confint(cox_bothincrease_pfs)
 val_anydecrease_ahr_uci_pfs <- ratio_to_string(exp(confint(cox_bothincrease_pfs)[1, 2]))
 val_anydecrease_ahr_p_pfs <- pval_to_string(summary(cox_bothincrease_pfs)$coefficients[1, 5] < 0.001)
 
-val_uva_fls_pfs_p <- pval_to_string(pfit_fls_survplot_pfs$cox$p)
+val_uva_fls_pfs_p <- pval_to_string(pfit_fls_survplot_pfs$cox$p, n_digits = 4)
 val_uva_fls_os_p <- pval_to_string(pfit_fls_survplot_os$cox$p)
 val_uva_fls_pfs_ahr <- ratio_to_string(pfit_fls_survplot_pfs$cox$aHR)
 val_uva_fls_pfs_ahr_lci <- ratio_to_string(pfit_fls_survplot_pfs$cox$lCI)

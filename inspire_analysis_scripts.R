@@ -1,21 +1,29 @@
 median_range <- function(x, embellish='') {
+  median_string <- value_to_string(median(x, na.rm=T))
+  if (grepl('\\.', median_string)) {
+    post_decimal_numbers = nchar(strsplit(median_string, '\\.')[[1]][2])
+  } else {
+    post_decimal_numbers = 0
+  }
+  
   return(
     sprintf(
       '%s%s [range: %s, %s]',
       median(x, na.rm=T) %>% value_to_string,
       embellish,
-      min(x, na.rm=T) %>% value_to_string,
-      max(x, na.rm=T) %>% value_to_string
+      min(x, na.rm=T) %>% round(post_decimal_numbers) %>% sprintf(paste0('%.', as.character(post_decimal_numbers), 'f'), .),
+      max(x, na.rm=T) %>% round(post_decimal_numbers) %>% sprintf(paste0('%.', as.character(post_decimal_numbers), 'f'), .)
     )
   )
 }
 
-pval_to_string <- function(p) {
-  if (p < 0.001) {
-    return('p < 0.001')
+pval_to_string <- function(p, n_digits = 3) {
+  threshold = 10^(-n_digits)
+  if (p < threshold) {
+    return(sprintf('p < %s', threshold))
   } else {
     #return(sprintf('p=%#.3g', p))
-    return(sprintf('p=%s', round(p, 3)))
+    return(sprintf('p=%s', round(p, n_digits)))
   }
 }
 
